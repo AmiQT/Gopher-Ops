@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log"
-	"regexp"
 	"strings"
 
 	"github.com/google/generative-ai-go/genai"
@@ -19,9 +18,9 @@ type ActionIntent struct {
 	Target string
 }
 
-type Agent struct {
-	client *genai.Client
-	model  *genai.GenerativeModel
+type GeminiAgent struct {
+	client  *genai.Client
+	model   *genai.GenerativeModel
 	session *genai.ChatSession
 }
 
@@ -29,13 +28,20 @@ const systemPrompt = `You are a Senior SRE & AI Automation Engineer named "Gophe
 Your job is to monitor system health and act on infrastructure issues using actions provided to you. We are analyzing a live container environment alongside REAL memory & CPU load data from the host.
 
 CRITICAL TONE REQUIREMENT:
-You MUST reply speaking entirely in informal, Gen Z Malaysian slang (Bahasa Melayu pasar + Gen Z lingo). 
-Use words like: bro, weh, siot, gila, ngam, teruk, no cap, fr fr, slay, let him cook, mantap, koyak. 
-Never sound like a robot or use formal standard Indonesian. Be hyped and use relevant emojis like 💀😭🔥🦅✨.
+Anda mesti membalas menggunakan Bahasa Melayu yang santai dan sopan (friendly but professional). 
+Gunakan nada seorang jurutera yang berpengalaman tapi mesra. Elakkan penggunaan slang Gen Z yang berlebihan.
+Boleh gunakan emoji yang bersesuaian tapi jangan melampau. Sentiasa hormati Operator.
 
 VERY IMPORTANT:
 - Be EXTREMELY concise.
-- ONLY answer what the user asks. If they ask about RAM, just give RAM. If they ask about a specific container, just read that one container. DO NOT list out all containers or details unless explicitly asked.
+- ONLY answer what the user asks. 
+- FORMATTING: Every time you list containers or provide a status report, you MUST use a clean Bullet List with **Bold Headers**. Do NOT use Markdown Tables as they look messy on mobile.
+
+If asked for a container list or status:
+1. Use a Bullet List for containers. Format: 
+   - **[ID] Name** | State: [State] | Status: [Status]
+2. Use Bold Bullet Points for System Metrics (CPU/RAM).
+3. Do NOT include containers that were not explicitly mentioned or relevant unless "list all" is requested.
 
 When diagnosing, follow this flow:
 1. Examine the provided container states and the Host Metrics (CPU/RAM) silently.
@@ -47,12 +53,16 @@ If you want to perform an action on a container (Stop, Start, or Restart), you M
 - `+"`"+`StopContainer("container_id_here")`+"`"+`
 - `+"`"+`StartContainer("container_id_here")`+"`"+`
 - `+"`"+`RestartContainer("container_id_here")`+"`"+`
+- `+"`"+`ViewLogs("container_id_here")`+"`"+`
+- `+"`"+`TerraformApply()`+"`"+`
+- `+"`"+`AuditSecurity()`+"`"+`
+- `+"`"+`VisualMetrics()`+"`"+`
 - `+"`"+`ClearCache()`+"`"+`
 
 Example: If the user says "stop container 0ccfe811", YOUR response must include exactly `+"`"+`StopContainer("0ccfe811")`+"`"+`. Do NOT output `+"`"+`StopContainer()`+"`"+` without the ID.`
 
-// NewAgent sets up the generative model
-func NewAgent(apiKey string) (*Agent, error) {
+// NewGeminiAgent sets up the generative model
+func NewGeminiAgent(apiKey string) (*GeminiAgent, error) {
 	ctx := context.Background()
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
@@ -73,22 +83,22 @@ func NewAgent(apiKey string) (*Agent, error) {
 	
 	session := model.StartChat()
 
-	return &Agent{
-		client: client,
-		model:  model,
+	return &GeminiAgent{
+		client:  client,
+		model:   model,
 		session: session,
 	}, nil
 }
 
 // Close cleans up
-func (a *Agent) Close() {
+func (a *GeminiAgent) Close() {
 	if a.client != nil {
 		a.client.Close()
 	}
 }
 
 // ProcessRequest wraps the user query with system context before querying Gemini
-func (a *Agent) ProcessRequest(userMsg string) (string, []ActionIntent, error) {
+func (a *GeminiAgent) ProcessRequest(userMsg string) (string, []ActionIntent, error) {
 	ctx := context.Background()
 	var intents []ActionIntent
 
@@ -123,36 +133,7 @@ func (a *Agent) ProcessRequest(userMsg string) (string, []ActionIntent, error) {
 	}
 
 	// 3. Extract ActionIntents that the AI has suggested
-	
-	// STOP / SHUTDOWN CONTAINER
-	stopRe := regexp.MustCompile(`(?:Stop|Shutdown)Container\(['"]?([a-zA-Z0-9]+)['"]?\)`)
-	for _, matches := range stopRe.FindAllStringSubmatch(output, -1) {
-		if len(matches) > 1 {
-			intents = append(intents, ActionIntent{Action: "StopContainer", Target: matches[1]})
-		}
-	}
-
-	// START CONTAINER
-	startRe := regexp.MustCompile(`StartContainer\(['"]?([a-zA-Z0-9]+)['"]?\)`)
-	for _, matches := range startRe.FindAllStringSubmatch(output, -1) {
-		if len(matches) > 1 {
-			intents = append(intents, ActionIntent{Action: "StartContainer", Target: matches[1]})
-		}
-	}
-	
-	// RESTART CONTAINER
-	restartRe := regexp.MustCompile(`RestartContainer\(['"]?([a-zA-Z0-9]+)['"]?\)`)
-	for _, matches := range restartRe.FindAllStringSubmatch(output, -1) {
-		if len(matches) > 1 {
-			intents = append(intents, ActionIntent{Action: "RestartContainer", Target: matches[1]})
-		}
-	}
-
-	// CLEAR CACHE
-	clearCacheRe := regexp.MustCompile(`ClearCache\(\)`)
-	if clearCacheRe.MatchString(output) {
-		intents = append(intents, ActionIntent{Action: "ClearCache", Target: ""})
-	}
+	intents = ExtractIntents(output)
 
 	log.Printf("[OBSERVABILITY] Request: %s | Delivered successful response.", userMsg)
 
@@ -160,6 +141,61 @@ func (a *Agent) ProcessRequest(userMsg string) (string, []ActionIntent, error) {
 }
 
 // ResetSession clears the conversation history to save tokens
-func (a *Agent) ResetSession() {
+func (a *GeminiAgent) ResetSession() {
 	a.session = a.model.StartChat()
+}
+
+// DiagnoseIssue is a special prompt for Root Cause Analysis
+func (a *GeminiAgent) DiagnoseIssue(containerName, logs string) (string, error) {
+	ctx := context.Background()
+	
+	prompt := fmt.Sprintf(`SYSTEM ALERT: Container "%s" has crashed or reported an issue.
+LOG DATA:
+%s
+
+As a Senior SRE, please analyze these logs and tell me:
+1. What is the most likely cause of failure?
+2. What are the specific steps to fix it?
+Keep your answer concise and friendly in Bahasa Melayu.`, containerName, logs)
+
+	resp, err := a.model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		return "", err
+	}
+
+	var output string
+	for _, cand := range resp.Candidates {
+		for _, part := range cand.Content.Parts {
+			output += fmt.Sprintf("%s", part)
+		}
+	}
+	return output, nil
+}
+
+// AuditSecurity provides a security assessment
+func (a *GeminiAgent) AuditSecurity(ctxData string) (string, error) {
+	ctx := context.Background()
+	
+	prompt := fmt.Sprintf(`SYSTEM SECURITY AUDIT REQUEST.
+DATA:
+%s
+
+As a Senior Security Engineer, please analyze this infrastructure data and provide:
+1. A security score from 1 to 10.
+2. List of critical vulnerabilities or misconfigurations.
+3. Recommended hardening steps.
+Keep your answer professional but friendly in Bahasa Melayu.`, ctxData)
+
+	resp, err := a.model.GenerateContent(ctx, genai.Text(prompt))
+	if err != nil {
+		return "", err
+	}
+
+	var output string
+	for _, cand := range resp.Candidates {
+		for _, part := range cand.Content.Parts {
+			output += fmt.Sprintf("%s", part)
+		}
+	}
+	return output, nil
 }

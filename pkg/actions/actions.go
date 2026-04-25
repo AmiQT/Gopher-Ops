@@ -6,6 +6,8 @@ import (
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
+	"io"
+	"bytes"
 )
 
 // RestartContainer allows the AI to trigger a container restart.
@@ -60,4 +62,34 @@ func StopContainer(containerID string) (string, error) {
 func ClearCache() string {
 	// Normally this could run `redis-cli flushall` or similar inside an exec command.
 	return "System cache cleared successfully. Memory impact should decrease."
+}
+
+// GetContainerLogs fetches the last 10 lines of logs for a container
+func GetContainerLogs(containerID string) (string, error) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return "", err
+	}
+	defer cli.Close()
+
+	options := container.LogsOptions{
+		ShowStdout: true,
+		ShowStderr: true,
+		Tail:       "10",
+	}
+
+	out, err := cli.ContainerLogs(ctx, containerID, options)
+	if err != nil {
+		return "", err
+	}
+	defer out.Close()
+
+	buf := new(bytes.Buffer)
+	_, err = io.Copy(buf, out)
+	if err != nil {
+		return "", err
+	}
+
+	return buf.String(), nil
 }
