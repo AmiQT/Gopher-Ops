@@ -116,9 +116,9 @@ func (a *LocalAgent) DiagnoseIssue(containerName, logs string) (string, error) {
 }
 
 // AuditSecurity provides assessment via local LLM
-func (a *LocalAgent) AuditSecurity(ctxData string) (string, error) {
+func (a *LocalAgent) AuditSecurity(ctxData, imageScanData string) (string, error) {
 	ctx := context.Background()
-	prompt := fmt.Sprintf("SECURITY AUDIT REQUEST.\nDATA:\n%s\n\nPlease provide security score and hardening steps in Bahasa Melayu.", ctxData)
+	prompt := fmt.Sprintf("SECURITY AUDIT REQUEST.\nCONTAINER DATA:\n%s\nIMAGE VULN DATA:\n%s\n\nPlease provide security score and hardening steps in Bahasa Melayu.", ctxData, imageScanData)
 	
 	resp, err := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: a.model,
@@ -132,3 +132,22 @@ func (a *LocalAgent) AuditSecurity(ctxData string) (string, error) {
 	}
 	return resp.Choices[0].Message.Content, nil
 }
+
+// TriageIssue provides a deeper investigation flow via local LLM
+func (a *LocalAgent) TriageIssue(containerName, triageType, data string) (string, error) {
+	ctx := context.Background()
+	prompt := fmt.Sprintf("SRE TRIAGE REQUEST.\nTarget: %s\nType: %s\nData:\n%s\n\nPlease provide investigation findings in Bahasa Melayu.", containerName, triageType, data)
+	
+	resp, err := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+		Model: a.model,
+		Messages: []openai.ChatCompletionMessage{
+			{Role: openai.ChatMessageRoleSystem, Content: a.sysPrompt},
+			{Role: openai.ChatMessageRoleUser, Content: prompt},
+		},
+	})
+	if err != nil {
+		return "", err
+	}
+	return resp.Choices[0].Message.Content, nil
+}
+

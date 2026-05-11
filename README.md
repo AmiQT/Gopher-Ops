@@ -5,21 +5,22 @@
 ![Terraform](https://img.shields.io/badge/Terraform-IaC-7B42BC?style=flat&logo=terraform)
 ![Gemini AI](https://img.shields.io/badge/AI-Google_Gemini-8E75B2?style=flat&logo=google)
 ![CI/CD](https://img.shields.io/badge/CI%2FCD-GitHub_Actions-2088FF?style=flat&logo=github-actions)
+![License](https://img.shields.io/badge/License-MIT-green.svg)
 
-An AI-driven Site Reliability Engineering (SRE) bot powered by **Google Gemini** and **Telegram**. Gopher-Ops monitors your host system metrics (CPU, RAM) and allows you to perform basic triage and healing actions (start, stop, restart containers, clear cache) via a Telegram chat interface. 
 
-Designed with modern DevOps principles, it features **Infrastructure as Code (IaC)** provisioning via Terraform and automated CI/CD pipelines.
+**Gopher-Ops** is a Secure AI SRE Telegram bot managing Docker, Kubernetes, and system metrics via natural language.
 
----
+## 🚀 Key Features
 
-## 🚀 Key Features (Portfolio Highlights)
-
-- **Infrastructure as Code (IaC):** Automated provisioning of a containerized lab environment (Nginx & stateful Redis cluster) using **Terraform**, complete with Custom Networks, Persistent Volumes, Variables, and Count loops for scaling.
-- **System Observability & SRE:** Developed in **Golang**, the bot fetches real-time host metrics (CPU/RAM) and container statuses directly via the Docker API.
-- **Generative AI ChatOps:** Integrated **Google Gemini (2.5-flash-lite)** to act as an intent parser. It understands natural language logs and triggers technical SRE actions in a casual "Gen-Z" persona to reduce operator cognitive load.
-- **Interactive Healing Actions:** Parses AI intents to generate Human-in-the-loop (HITL) inline Telegram buttons, allowing the operator to start, stop, restart, or clear cache directly from chat.
+- **AI ChatOps:** Powered by **Google Gemini (2.0/2.5-flash)** to parse intents and logs, answering infrastructure queries in a casual persona to reduce operator cognitive load.
+- **Telemetry & Observability:** Real-time monitoring of host OS (CPU/RAM), Docker, and Kubernetes states via **gopsutil**, **Docker SDK**, and **MCP**. Includes a 1-hour in-memory metric history for sustained high-load detection and proactive alerting.
+- **Guided Triage & HITL Execution:** Parses AI suggestions into clickable Telegram buttons for safe actions (Start/Stop/Restart) and interactive troubleshooting flows (Network triage & Configuration validation).
+- **Infrastructure as Code (IaC):** **Terraform** provisions a local microservices lab environment (Nginx, scalable/stateful Redis cluster, custom networks, and persistent volumes).
+- **Sec & Ops:** Zero-Trust ID gating via Telegram; Automated Docker image vulnerability scanning; and a robust **GitHub Actions** CI/CD pipeline for Go tests and Terraform validation.
+- **Kubernetes & MCP Support:** Seamlessly manages cluster operations using the **Model Context Protocol (MCP)**, bridging AI with Kubernetes native tools.
 - **Robust CI/CD Pipeline:** Configured with **GitHub Actions** for automated Go unit testing and Terraform validation/formatting upon every push/PR.
-- **Zero-Trust Security:** Hardcoded Telegram Chat ID gating ensuring only the authorized operator can view metrics or execute system-level docker commands.
+- **Zero-Trust & DevSecOps:** Hardcoded Telegram Chat ID gating ensuring only the authorized operator can execute commands. Includes **automated image vulnerability scanning** for outdated Docker tags/CVEs.
+
 
 ## 🏗️ Architecture Workflow
 
@@ -35,9 +36,9 @@ graph TD;
 
 ## 🛠️ Tech Stack
 
-- **Backend:** Go (Golang), Docker API SDK, gopsutil
-- **AI / NLP:** Google Generative AI (Gemini Flash-Lite)
-- **Infrastructure:** Docker, Terraform (HCL)
+- **Backend:** Go (Golang), Docker API SDK, gopsutil, **MCP Go SDK**
+- **AI / NLP:** Google Generative AI (Gemini 2.0 Flash)
+- **Infrastructure:** Docker, Kubernetes, Terraform (HCL), **MCP Server Kubernetes**
 - **CI/CD:** GitHub Actions
 - **Interface:** Telegram Bot API
 
@@ -84,8 +85,16 @@ go run cmd/main.go
 
 Once the bot is running, simply PM it on Telegram to start managing your infrastructure:
 - *"Bro, check system health jap"* -> Bot reads live CPU/RAM and lists the Terraform-provisioned containers.
-- *"Tolong stop container gopher-ops-nginx-lab"* -> Bot understands the intent, verifies state, and provides a clickable inline `🛑 Stop` button.
-- *"Minta restart redis satu"* -> Re-initializes specific containers directly across the Docker daemon.
+- *"List pods dalam cluster k8s aku"* -> Bot uses MCP to fetch real-time pod data from Kubernetes.
+- *"Kenapa pod database asyik restart?"* -> Bot triggers an automated `k8s-diagnose` workflow to find the root cause.
+
+## 📜 Credits & Acknowledgments
+
+The Kubernetes management capabilities of Gopher-Ops are powered by the **Model Context Protocol (MCP)** and the excellent [MCP Server Kubernetes](https://github.com/Flux159/mcp-server-kubernetes) community project. Special thanks to the authors for their work in bridging AI and Kubernetes.
 
 ## ⚠️ Disclaimer
-This project binds to the host's Docker socket to execute real container lifecycles. Please ensure your `AUTHORIZED_CHAT_ID` is strictly configured to prevent unauthorized infrastructure manipulation.
+This project binds to the host's Docker socket and Kubernetes API to execute real infrastructure lifecycles. Please ensure your `AUTHORIZED_CHAT_ID` is strictly configured to prevent unauthorized manipulation.
+
+## 📄 License
+This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for more details.
+

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"log"
 	"os"
@@ -11,9 +12,11 @@ import (
 	"gopher-ops/pkg/ai"
 	"gopher-ops/pkg/monitor"
 
-	"github.com/go-telegram-bot-api/telegram-bot-api/v5"
-	"github.com/joho/godotenv"
+	"sync"
 	"time"
+
+	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	"github.com/joho/godotenv"
 )
 
 func main() {
@@ -115,10 +118,45 @@ func main() {
 			continue
 		}
 
+		if update.Message.IsCommand() {
+			msgText := ""
+			switch update.Message.Command() {
+			case "start":
+				msgText = "🤖 **Gopher-Ops Ready!**\nSebut je apa kau nak aku buat kat server ni mat."
+			case "help":
+				msgText = "📖 **COMMANDS:**\n/start - Mula sembang\n/help - Tengok ni\n/status - Check bot & AI status\n/reset - Clear state"
+			case "status":
+				// Get live metrics for status
+				health, _ := monitor.GetSystemHealth()
+				provider := os.Getenv("LLM_PROVIDER")
+				model := os.Getenv("LLM_MODEL")
+				autoPilot := "DISABLED ❌"
+				if os.Getenv("AUTOPILOT_ENABLED") == "true" {
+					autoPilot = "ACTIVE ✅ (Self-Healing On)"
+				}
+
+				msgText = fmt.Sprintf("🤖 **GOPHER-OPS STATUS**\n\n"+
+					"🧠 **AI Engine:** %s (%s)\n"+
+					"🤖 **Autopilot:** %s\n\n"+
+					"📊 **Live Metrics:**\n%s",
+					strings.ToUpper(provider), model, autoPilot, health)
+			case "reset":
+				// Manual state reset via Telegram command
+				os.Remove("state.json")
+				msgText = "🧹 **STATE CLEARED!** Hafiz dah lupa sejarah lama. Kita mula hidup baru."
+			default:
+				msgText = "Command apa tu mat? Aku tak faham ah. 😂"
+			}
+			msg := tgbotapi.NewMessage(update.Message.Chat.ID, msgText)
+			msg.ParseMode = "Markdown"
+			bot.Send(msg)
+			continue
+		}
+
 		if !update.Message.IsCommand() {
 			// Normal chat message
 			input := strings.TrimSpace(update.Message.Text)
-			
+
 			if input == "clear" {
 				agent.ResetSession()
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "🧹 Gopher-Ops: Chat memory cleared! Token history reset jadi 0. Jimat token LFG! ✨")
@@ -130,7 +168,7 @@ func main() {
 			// Send a loading message
 			msgLoader := tgbotapi.NewMessage(update.Message.Chat.ID, "🧠 Gopher-Ops is thinking...")
 			sentLoader, _ := bot.Send(msgLoader)
-			
+
 			// Process via AI
 			response, intents, err := agent.ProcessRequest(input)
 			if err != nil {
@@ -143,13 +181,13 @@ func main() {
 			// Edit message with final AI response
 			respMsg := tgbotapi.NewEditMessageText(update.Message.Chat.ID, sentLoader.MessageID, response)
 			respMsg.ParseMode = "Markdown"
-			
+
 			// Build Inline Keyboard if there are intentions
 			if len(intents) > 0 {
 				var rows [][]tgbotapi.InlineKeyboardButton
 				for _, intent := range intents {
 					callbackData := fmt.Sprintf("%s:%s", intent.Action, intent.Target) // e.g. "StopContainer:0ccfe811"
-					
+
 					btnText := ""
 					targetName := intent.Target
 					if intent.Target != "" {
@@ -182,12 +220,16 @@ func main() {
 						btnText = "🛡️ Audit Security Level"
 					case "VisualMetrics":
 						btnText = "📊 Show System Pulse"
+					case "InvestigateNetwork":
+						btnText = "🌐 Triage: Network " + targetName
+					case "CheckConfig":
+						btnText = "⚙️ Triage: Config " + targetName
 					}
 
 					btn := tgbotapi.NewInlineKeyboardButtonData(btnText, callbackData)
 					rows = append(rows, tgbotapi.NewInlineKeyboardRow(btn))
 				}
-				
+
 				keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
 				respMsg.ReplyMarkup = &keyboard
 			}
@@ -250,7 +292,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 	case "AnalyzeRCA":
 		logs, _ := actions.GetContainerLogs(target)
 		name := monitor.GetContainerName(target)
-		
+
 		// Send a "Processing" message because AI takes time
 		msgProc := tgbotapi.NewMessage(callback.Message.Chat.ID, "🔍 *Gopher-Ops sedang menganalisis log... Sabar jap.*")
 		msgProc.ParseMode = "Markdown"
@@ -271,18 +313,48 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		}
 	case "AuditSecurity":
 		data, _ := monitor.GetSecurityContext()
-		
+		imageScanData, _ := monitor.GetImageSecurityReport()
+
 		msgProc := tgbotapi.NewMessage(callback.Message.Chat.ID, "🛡️ *Gopher-Ops sedang melakukan audit keselamatan...*")
 		msgProc.ParseMode = "Markdown"
 		bot.Send(msgProc)
 
-		analysis, err := agent.AuditSecurity(data)
+		analysis, err := agent.AuditSecurity(data, imageScanData)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ Aduh, AI gagal buat audit: %v", err)
 		} else {
 			resMsg = fmt.Sprintf("🛡️ **SECURITY AUDIT REPORT**\n\n%s", analysis)
 		}
+	case "InvestigateNetwork":
+		data := actions.InvestigateNetwork(target)
+		name := monitor.GetContainerName(target)
+
+		msgProc := tgbotapi.NewMessage(callback.Message.Chat.ID, "🌐 *Gopher-Ops sedang memeriksa rangkaian...*")
+		msgProc.ParseMode = "Markdown"
+		bot.Send(msgProc)
+
+		analysis, err := agent.TriageIssue(name, "Network Connectivity", data)
+		if err != nil {
+			resMsg = fmt.Sprintf("❌ AI pening nak check network: %v", err)
+		} else {
+			resMsg = fmt.Sprintf("🌐 **ANALISIS RANGKAIAN: %s**\n\n%s", name, analysis)
+		}
+	case "CheckConfig":
+		data := actions.CheckConfig(target)
+		name := monitor.GetContainerName(target)
+
+		msgProc := tgbotapi.NewMessage(callback.Message.Chat.ID, "⚙️ *Gopher-Ops sedang memeriksa konfigurasi...*")
+		msgProc.ParseMode = "Markdown"
+		bot.Send(msgProc)
+
+		analysis, err := agent.TriageIssue(name, "Configuration Validation", data)
+		if err != nil {
+			resMsg = fmt.Sprintf("❌ AI pening nak check config: %v", err)
+		} else {
+			resMsg = fmt.Sprintf("⚙️ **ANALISIS KONFIGURASI: %s**\n\n%s", name, analysis)
+		}
 	case "VisualMetrics":
+
 		metrics, _ := monitor.GetVisualMetrics()
 		resMsg = metrics
 	default:
@@ -296,12 +368,54 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 // startBackgroundMonitor checks system health every X minutes and alerts the user
 func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64) {
 	log.Println("🩺 Background monitor started...")
-	
+
 	// Initial state
 	previousStates, err := monitor.GetContainerStates()
 	if err != nil {
 		log.Printf("⚠️ Monitor error during init: %v", err)
 	}
+
+	// Tracker for auto-restarts and alert cooldowns
+	restartTracker := make(map[string]int)
+	alertState := make(map[string]string)
+
+	// Helper to save state with Mutex to prevent race conditions
+	var mu sync.Mutex
+	saveState := func() {
+		mu.Lock()
+		defer mu.Unlock()
+
+		state := struct {
+			Restarts map[string]int    `json:"restarts"`
+			Alerts   map[string]string `json:"alerts"`
+		}{
+			Restarts: restartTracker,
+			Alerts:   alertState,
+		}
+		data, _ := json.Marshal(state)
+		// Atomic-like write: write then rename if we were on Linux,
+		// but on Windows we'll just be careful with the file handle.
+		os.WriteFile("state.json", data, 0644)
+	}
+
+	// Load existing state if any
+	if file, err := os.ReadFile("state.json"); err == nil {
+		var state struct {
+			Restarts map[string]int    `json:"restarts"`
+			Alerts   map[string]string `json:"alerts"`
+		}
+		if err := json.Unmarshal(file, &state); err == nil {
+			restartTracker = state.Restarts
+			alertState = state.Alerts
+			log.Println("💾 State loaded from state.json")
+		}
+	}
+
+	// Token Saver: Cache for RCA results
+	rcaCache := make(map[string]struct {
+		Result    string
+		Timestamp time.Time
+	})
 
 	ticker := time.NewTicker(1 * time.Minute)
 	for range ticker.C {
@@ -315,42 +429,65 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 
 		for id, current := range currentStates {
 			prev, exists := previousStates[id]
-			
-			// Detect if container state changed to something bad (exited/dead)
+
+			// Detect failure
 			if exists && prev.State == "running" && current.State != "running" {
-				if autoPilot {
+				count := restartTracker[id]
+
+				if autoPilot && count < 3 {
 					// --- AUTO-PILOT MODE ---
-					log.Printf("🤖 Auto-Pilot: Detecting failure in %s (%s). Attempting auto-fix...", current.Name, id)
-					
-					// 1. Analyze RCA
-					logs, _ := actions.GetContainerLogs(id)
-					analysis, _ := agent.DiagnoseIssue(current.Name, logs)
-					
-					// 2. Perform Restart
+					restartTracker[id]++
+					log.Printf("🤖 Auto-Pilot: Attempt #%d for %s (%s).", restartTracker[id], current.Name, id)
+
+					// Token Saver: Check cache first
+					var analysis string
+					if cache, ok := rcaCache[id]; ok && time.Since(cache.Timestamp) < 10*time.Minute {
+						analysis = cache.Result + "\n\n*(Nota: Analisis dari cache 10 minit terakhir)*"
+					} else {
+						logs, _ := actions.GetContainerLogs(id)
+						analysis, _ = agent.DiagnoseIssue(current.Name, logs)
+						rcaCache[id] = struct {
+							Result    string
+							Timestamp time.Time
+						}{Result: analysis, Timestamp: time.Now()}
+					}
+
 					actions.RestartContainer(id)
-					
-					// 3. Notify User
-					msgText := fmt.Sprintf("🤖 **AUTOPILOT ACTION!**\n\nContainer **%s** tadi DOWN. Aku dah tolong restartkan untuk kau!\n\n**Analisis AI:**\n%s", current.Name, analysis)
+
+					msgText := fmt.Sprintf("🤖 **AUTOPILOT ACTION! (Attempt %d/3)**\n\nContainer **%s** tadi DOWN. Aku dah tolong restartkan untuk kau!\n\n**Analisis AI:**\n%s", restartTracker[id], current.Name, analysis)
 					msg := tgbotapi.NewMessage(chatID, msgText)
 					msg.ParseMode = "Markdown"
 					bot.Send(msg)
-				} else {
-					// --- MANUAL MODE ---
-					alertMsg := fmt.Sprintf("⚠️ **ALERT!** Container **%s** (%s) dah **DOWN**! (Status: %s)\nNak aku restart ke bro?", current.Name, id, current.State)
-					
+					alertState[id] = "autopilot_sent"
+					saveState()
+				} else if alertState[id] != "alert_sent" {
+					// --- MANUAL/SURRENDER MODE (With Spam Protection) ---
+					alertMsg := ""
+					if count >= 3 {
+						alertMsg = fmt.Sprintf("🚨 **CRITICAL ALERT!**\n\nContainer **%s** dah restart 3 kali tapi still DOWN mat. 💀 Aku dah 'surrender'. Kau kena check manual jap bro.", current.Name)
+						alertState[id] = "alert_sent" // Mark as sent so we don't spam
+					} else {
+						alertMsg = fmt.Sprintf("⚠️ **ALERT!** Container **%s** dah **DOWN**! (Status: %s)\nNak aku restart ke bro?", current.Name, current.State)
+						alertState[id] = "alert_sent"
+					}
+
 					msg := tgbotapi.NewMessage(chatID, alertMsg)
 					msg.ParseMode = "Markdown"
-					
-					// Add Buttons
 					btnRestart := tgbotapi.NewInlineKeyboardButtonData("🔄 Restart Now", "RestartContainer:"+id)
 					btnRCA := tgbotapi.NewInlineKeyboardButtonData("🔍 Siasat Punca (RCA)", "AnalyzeRCA:"+id)
-					
-					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
-						tgbotapi.NewInlineKeyboardRow(btnRestart),
-						tgbotapi.NewInlineKeyboardRow(btnRCA),
-					)
-					
+					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnRestart), tgbotapi.NewInlineKeyboardRow(btnRCA))
 					bot.Send(msg)
+					saveState()
+				}
+			}
+
+			// Reset counter and alert state if container is healthy
+			if current.State == "running" {
+				if restartTracker[id] > 0 || alertState[id] != "" {
+					log.Printf("✨ %s is healthy again. Resetting trackers.", current.Name)
+					restartTracker[id] = 0
+					alertState[id] = ""
+					saveState()
 				}
 			}
 		}
@@ -369,6 +506,19 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 					bot.Send(msg)
 				}
 			}
+		}
+
+		// --- NEW: SUSTAINED LOAD ALERT (Idea 3) ---
+		// Check if CPU average is > 80% for the last 5 checks (minutes)
+		if monitor.GlobalMetricStore.CheckSustainedLoad(80.0, 5) {
+			alertMsg := "🔥 **SUSTAINED HIGH LOAD ALERT!**\n\nCPU load kau dah lebih **80%** untuk 5 minit berturut-turut bro! Server tengah berpeluh tu. 🥵\n\nNak aku check container mana yang makan resource paling banyak?"
+			msg := tgbotapi.NewMessage(chatID, alertMsg)
+			msg.ParseMode = "Markdown"
+
+			btnCheck := tgbotapi.NewInlineKeyboardButtonData("📊 Check Resource Hogs", "VisualMetrics:all")
+			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnCheck))
+
+			bot.Send(msg)
 		}
 
 		previousStates = currentStates

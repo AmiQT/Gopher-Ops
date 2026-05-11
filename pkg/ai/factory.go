@@ -13,7 +13,10 @@ type AIAgent interface {
 	// DiagnoseIssue provides RCA for a container issue
 	DiagnoseIssue(containerName, logs string) (string, error)
 	// AuditSecurity provides a security assessment
-	AuditSecurity(ctxData string) (string, error)
+	AuditSecurity(ctxData, imageScanData string) (string, error)
+	// TriageIssue provides a deeper investigation flow
+	TriageIssue(containerName, triageType, data string) (string, error)
+
 	// Close cleans up any resources
 	Close()
 }
@@ -31,7 +34,7 @@ type Config struct {
 func NewAgent(cfg Config) (AIAgent, error) {
 	switch cfg.Provider {
 	case "gemini":
-		return NewGeminiAgent(cfg.APIKey)
+		return NewGeminiAgent(cfg.APIKey, cfg.ModelName)
 	case "local":
 		return NewLocalAgent(cfg)
 	default:

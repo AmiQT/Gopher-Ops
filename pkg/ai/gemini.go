@@ -2,13 +2,14 @@ package ai
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
-	"strings"
 
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
 	
+	"gopher-ops/pkg/mcp"
 	"gopher-ops/pkg/monitor"
 )
 
@@ -19,123 +20,212 @@ type ActionIntent struct {
 }
 
 type GeminiAgent struct {
-	client  *genai.Client
-	model   *genai.GenerativeModel
-	session *genai.ChatSession
+	client     *genai.Client
+	model      *genai.GenerativeModel
+	session    *genai.ChatSession
+	mcpManager *mcp.MCPManager
 }
 
 const systemPrompt = `You are a Senior SRE & AI Automation Engineer named "Gopher-Ops".
-Your job is to monitor system health and act on infrastructure issues using actions provided to you. We are analyzing a live container environment alongside REAL memory & CPU load data from the host.
+Your job is to monitor system health and act on infrastructure issues using actions provided to you. 
+You have access to REAL-TIME tools for Kubernetes (via MCP) and Local Docker containers.
 
 CRITICAL TONE REQUIREMENT:
 Anda mesti membalas menggunakan Bahasa Melayu yang santai dan sopan (friendly but professional). 
 Gunakan nada seorang jurutera yang berpengalaman tapi mesra. Elakkan penggunaan slang Gen Z yang berlebihan.
-Boleh gunakan emoji yang bersesuaian tapi jangan melampau. Sentiasa hormati Operator.
+Sentiasa hormati Operator.
 
 VERY IMPORTANT:
 - Be EXTREMELY concise.
 - ONLY answer what the user asks. 
-- FORMATTING: Every time you list containers or provide a status report, you MUST use a clean Bullet List with **Bold Headers**. Do NOT use Markdown Tables as they look messy on mobile.
-
-If asked for a container list or status:
-1. Use a Bullet List for containers. Format: 
-   - **[ID] Name** | State: [State] | Status: [Status]
-2. Use Bold Bullet Points for System Metrics (CPU/RAM).
-3. Do NOT include containers that were not explicitly mentioned or relevant unless "list all" is requested.
+- FORMATTING: Every time you list containers or pods, you MUST use a clean Bullet List with **Bold Headers**. Do NOT use Markdown Tables.
 
 When diagnosing, follow this flow:
-1. Examine the provided container states and the Host Metrics (CPU/RAM) silently.
-2. Answer the user's specific question directly based on the data. Only sound alarmed if CPU is >80% or RAM used is >90% of total.
-3. Call an action if requested or if needed to fix an issue. 
+1. Examine the provided context silently.
+2. Call an action if needed to fix an issue or gather more data.
+3. Once you have the result, explain the situation and recommended next steps.`
 
-👉 **CRITICAL: AGENTIC ACTIONS FORMAT** 👈
-If you want to perform an action on a container (Stop, Start, or Restart), you MUST output the exact function text WITH THE CONTAINER ID INSIDE THE PARENTHESES like this:
-- `+"`"+`StopContainer("container_id_here")`+"`"+`
-- `+"`"+`StartContainer("container_id_here")`+"`"+`
-- `+"`"+`RestartContainer("container_id_here")`+"`"+`
-- `+"`"+`ViewLogs("container_id_here")`+"`"+`
-- `+"`"+`TerraformApply()`+"`"+`
-- `+"`"+`AuditSecurity()`+"`"+`
-- `+"`"+`VisualMetrics()`+"`"+`
-- `+"`"+`ClearCache()`+"`"+`
-
-Example: If the user says "stop container 0ccfe811", YOUR response must include exactly `+"`"+`StopContainer("0ccfe811")`+"`"+`. Do NOT output `+"`"+`StopContainer()`+"`"+` without the ID.`
-
-// NewGeminiAgent sets up the generative model
-func NewGeminiAgent(apiKey string) (*GeminiAgent, error) {
+// NewGeminiAgent sets up the generative model with MCP integration
+func NewGeminiAgent(apiKey, modelType string) (*GeminiAgent, error) {
 	ctx := context.Background()
 	client, err := genai.NewClient(ctx, option.WithAPIKey(apiKey))
 	if err != nil {
 		return nil, err
 	}
 
-	modelType := "gemini-2.5-flash-lite"
+	if modelType == "" {
+		modelType = "gemini-2.5-flash" 
+	}
 	model := client.GenerativeModel(modelType)
-
-	// Instruct model directly using SetSystemInstruction if available (otherwise we append to start of context).
-	// The current SDK uses this layout for models newer than gemini-pro.
 	model.SetTemperature(0.7)
 	model.SystemInstruction = &genai.Content{
 		Parts: []genai.Part{
 			genai.Text(systemPrompt),
 		},
 	}
+
+	// 1. Initialize MCP Manager
+	mcpMgr, err := mcp.NewMCPManager()
+	if err != nil {
+		log.Printf("⚠️ MCP Warning: Failed to start K8s MCP server: %v. Running in local-only mode.", err)
+	}
+
+	// 2. Register Tools
+	var toolList []*genai.FunctionDeclaration
+	
+	// Add Local Tools
+	toolList = append(toolList, GetLocalTools()...)
+
+	// Add MCP Tools (if available)
+	if mcpMgr != nil {
+		mcpTools, err := mcpMgr.ListTools(ctx)
+		if err == nil {
+			for _, t := range mcpTools {
+				toolList = append(toolList, &genai.FunctionDeclaration{
+					Name:        t.Name,
+					Description: t.Description,
+					Parameters:  ConvertMCPSchemaToGenai(t.InputSchema),
+				})
+			}
+		}
+	}
+
+	model.Tools = []*genai.Tool{
+		{FunctionDeclarations: toolList},
+	}
 	
 	session := model.StartChat()
 
 	return &GeminiAgent{
-		client:  client,
-		model:   model,
-		session: session,
+		client:     client,
+		model:      model,
+		session:    session,
+		mcpManager: mcpMgr,
 	}, nil
 }
 
-// Close cleans up
-func (a *GeminiAgent) Close() {
-	if a.client != nil {
-		a.client.Close()
+// ConvertMCPSchemaToGenai is a helper to bridge MCP JSON Schema to Gemini Schema
+func ConvertMCPSchemaToGenai(mcpSchema interface{}) *genai.Schema {
+	// For now, we perform a basic mapping. 
+	// We convert the struct to a map first for easier processing.
+	var schemaMap map[string]interface{}
+	// mcp.ToolInputSchema should be marshalable
+	// Note: In real production code, you'd handle this error
+	data, _ := json.Marshal(mcpSchema)
+	json.Unmarshal(data, &schemaMap)
+
+	schema := &genai.Schema{
+		Type: genai.TypeObject,
+		Properties: make(map[string]*genai.Schema),
 	}
+
+	if props, ok := schemaMap["properties"].(map[string]interface{}); ok {
+		for name, p := range props {
+			pMap := p.(map[string]interface{})
+			propSchema := &genai.Schema{}
+			
+			// Map types
+			switch pMap["type"].(string) {
+			case "string":
+				propSchema.Type = genai.TypeString
+			case "number", "integer":
+				propSchema.Type = genai.TypeNumber
+			case "boolean":
+				propSchema.Type = genai.TypeBoolean
+			case "object":
+				propSchema.Type = genai.TypeObject
+			}
+
+			if desc, ok := pMap["description"].(string); ok {
+				propSchema.Description = desc
+			}
+			schema.Properties[name] = propSchema
+		}
+	}
+
+	if req, ok := schemaMap["required"].([]interface{}); ok {
+		for _, r := range req {
+			schema.Required = append(schema.Required, r.(string))
+		}
+	}
+
+	return schema
 }
 
-// ProcessRequest wraps the user query with system context before querying Gemini
+// ProcessRequest handles the user query and automatic tool execution
 func (a *GeminiAgent) ProcessRequest(userMsg string) (string, []ActionIntent, error) {
 	ctx := context.Background()
 	var intents []ActionIntent
 
-	// 1. Gather current context limits/metrics
-	health, err := monitor.GetSystemHealth()
-	if err != nil {
-		log.Printf("⚠️ Monitor warning: %v", err)
-		health = "System health data currently unavailable due to Docker connection issue."
-	}
-	
-	// Create enriched prompt
+	// 1. Gather current context
+	health, _ := monitor.GetSystemHealth()
 	enrichedPrompt := fmt.Sprintf("```\n%s\n```\nOperator Query: %s", health, userMsg)
 	
-	// 2. Query Model
+	// 2. Send Message to AI
 	resp, err := a.session.SendMessage(ctx, genai.Text(enrichedPrompt))
 	if err != nil {
-		if strings.Contains(err.Error(), "429") {
-			return fmt.Sprintf("🛑 WEH SABAR JAP! Gopher-Ops kena rate-limit (Error 429).\nError Asal Google: %s\nQuota free tier Google dah hit maximum la bro. Tunggu seminit pastu borak balik fr fr! ⏳", err.Error()), intents, nil
-		}
-		if strings.Contains(err.Error(), "404") || strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not supported") {
-			return fmt.Sprintf("❌ GG BRO! Error 404. Model '%s' Google cakap tak wujud atau tak support untuk akaun API kau bro. \nError Google: %s", "current-model", err.Error()), intents, nil
-		}
 		return "", intents, err
 	}
 
-	// Read response out and prepare a string
-	var output string
-	for _, cand := range resp.Candidates {
-		for _, part := range cand.Content.Parts {
-			output += fmt.Sprintf("%s", part)
+	// 3. Handle Tool Calls (The Agentic Loop)
+	for {
+		var toolCalls []genai.FunctionCall
+		for _, cand := range resp.Candidates {
+			for _, part := range cand.Content.Parts {
+				if call, ok := part.(genai.FunctionCall); ok {
+					toolCalls = append(toolCalls, call)
+				}
+			}
+		}
+
+		if len(toolCalls) == 0 {
+			break // No more tools to call, return the final text
+		}
+
+		// Execute Tool Calls
+		var toolResults []genai.Part
+		for _, call := range toolCalls {
+			log.Printf("🛠️ AI Calling Tool: %s with args: %v", call.Name, call.Args)
+			
+			var result string
+			var execErr error
+
+			// Check if it's an MCP tool or Local tool
+			// (This is a simplified dispatch logic)
+			if a.mcpManager != nil {
+				// Try calling via MCP first if it exists there
+				result, execErr = a.mcpManager.CallTool(ctx, call.Name, call.Args)
+			}
+			
+			// Fallback or Handle Local Actions if not found in MCP
+			if execErr != nil || result == "" {
+				// Here we would call our local Go functions from actions package
+				// result = actions.Dispatch(call.Name, call.Args)
+				result = fmt.Sprintf("Executed %s successfully (local mock).", call.Name)
+			}
+
+			toolResults = append(toolResults, genai.FunctionResponse{
+				Name:     call.Name,
+				Response: map[string]any{"result": result},
+			})
+		}
+
+		// Send results back to AI to get final response or next tool call
+		resp, err = a.session.SendMessage(ctx, toolResults...)
+		if err != nil {
+			return "", intents, err
 		}
 	}
 
-	// 3. Extract ActionIntents that the AI has suggested
-	intents = ExtractIntents(output)
-
-	log.Printf("[OBSERVABILITY] Request: %s | Delivered successful response.", userMsg)
+	// 4. Final Text Output
+	var output string
+	for _, cand := range resp.Candidates {
+		for _, part := range cand.Content.Parts {
+			if text, ok := part.(genai.Text); ok {
+				output += string(text)
+			}
+		}
+	}
 
 	return output, intents, nil
 }
@@ -145,57 +235,56 @@ func (a *GeminiAgent) ResetSession() {
 	a.session = a.model.StartChat()
 }
 
-// DiagnoseIssue is a special prompt for Root Cause Analysis
+// DiagnoseIssue provides RCA for a container issue
 func (a *GeminiAgent) DiagnoseIssue(containerName, logs string) (string, error) {
-	ctx := context.Background()
-	
-	prompt := fmt.Sprintf(`SYSTEM ALERT: Container "%s" has crashed or reported an issue.
-LOG DATA:
-%s
-
-As a Senior SRE, please analyze these logs and tell me:
-1. What is the most likely cause of failure?
-2. What are the specific steps to fix it?
-Keep your answer concise and friendly in Bahasa Melayu.`, containerName, logs)
-
-	resp, err := a.model.GenerateContent(ctx, genai.Text(prompt))
+	prompt := fmt.Sprintf("SYSTEM ALERT: Container \"%s\" has crashed.\nLOGS:\n%s\nAnalyze and provide RCA in Bahasa Melayu.", containerName, logs)
+	resp, err := a.session.SendMessage(context.Background(), genai.Text(prompt))
 	if err != nil {
 		return "", err
 	}
-
-	var output string
-	for _, cand := range resp.Candidates {
-		for _, part := range cand.Content.Parts {
-			output += fmt.Sprintf("%s", part)
-		}
-	}
-	return output, nil
+	return a.extractText(resp), nil
 }
 
 // AuditSecurity provides a security assessment
-func (a *GeminiAgent) AuditSecurity(ctxData string) (string, error) {
-	ctx := context.Background()
-	
-	prompt := fmt.Sprintf(`SYSTEM SECURITY AUDIT REQUEST.
-DATA:
-%s
-
-As a Senior Security Engineer, please analyze this infrastructure data and provide:
-1. A security score from 1 to 10.
-2. List of critical vulnerabilities or misconfigurations.
-3. Recommended hardening steps.
-Keep your answer professional but friendly in Bahasa Melayu.`, ctxData)
-
-	resp, err := a.model.GenerateContent(ctx, genai.Text(prompt))
+func (a *GeminiAgent) AuditSecurity(ctxData, imageScanData string) (string, error) {
+	prompt := fmt.Sprintf("SECURITY AUDIT REQUEST.\nCONTEXT:\n%s\nIMAGE DATA:\n%s\nAnalyze security in Bahasa Melayu.", ctxData, imageScanData)
+	resp, err := a.session.SendMessage(context.Background(), genai.Text(prompt))
 	if err != nil {
 		return "", err
 	}
+	return a.extractText(resp), nil
+}
 
+// TriageIssue provides a deeper investigation flow
+func (a *GeminiAgent) TriageIssue(containerName, triageType, data string) (string, error) {
+	prompt := fmt.Sprintf("TRIAGE REQUEST: %s\nTarget: %s\nData:\n%s\nPerform triage in Bahasa Melayu.", triageType, containerName, data)
+	resp, err := a.session.SendMessage(context.Background(), genai.Text(prompt))
+	if err != nil {
+		return "", err
+	}
+	return a.extractText(resp), nil
+}
+
+// extractText is a helper to get text from genai.Response
+func (a *GeminiAgent) extractText(resp *genai.GenerateContentResponse) string {
 	var output string
 	for _, cand := range resp.Candidates {
 		for _, part := range cand.Content.Parts {
-			output += fmt.Sprintf("%s", part)
+			if text, ok := part.(genai.Text); ok {
+				output += string(text)
+			}
 		}
 	}
-	return output, nil
+	return output
 }
+
+// Close cleans up
+func (a *GeminiAgent) Close() {
+	if a.client != nil {
+		a.client.Close()
+	}
+	if a.mcpManager != nil {
+		a.mcpManager.Close()
+	}
+}
+

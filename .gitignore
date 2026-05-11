@@ -8,6 +8,11 @@
 # Environment variables
 .env
 .env.*
+state.json
+
+# Binaries
+gopher-ops
+gopher-ops.exe
 
 # Go workspace
 go.work

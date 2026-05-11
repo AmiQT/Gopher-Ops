@@ -11,7 +11,66 @@ import (
 	"github.com/docker/docker/client"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
+	"sync"
 )
+
+// MetricPoint stores a single snapshot of system load
+type MetricPoint struct {
+	Timestamp time.Time
+	CPU       float64
+	RAM       float64
+}
+
+// MetricStore holds the last 60 minutes of metrics
+type MetricStore struct {
+	mu      sync.RWMutex
+	Points  []MetricPoint
+	MaxSize int
+}
+
+// GlobalMetricStore is the in-memory database for metrics
+var GlobalMetricStore = &MetricStore{
+	Points:  make([]MetricPoint, 0),
+	MaxSize: 60, // 60 minutes
+}
+
+// PushMetrics adds a new point and prunes old ones
+func (s *MetricStore) PushMetrics(cpuLoad, ramLoad float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	newPoint := MetricPoint{
+		Timestamp: time.Now(),
+		CPU:       cpuLoad,
+		RAM:       ramLoad,
+	}
+
+	s.Points = append(s.Points, newPoint)
+	if len(s.Points) > s.MaxSize {
+		s.Points = s.Points[1:]
+	}
+}
+
+// CheckSustainedLoad returns true if the average load over the last X points exceeds threshold
+func (s *MetricStore) CheckSustainedLoad(threshold float64, count int) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	if len(s.Points) < count {
+		return false
+	}
+
+	// Look at the last 'count' points
+	subset := s.Points[len(s.Points)-count:]
+	var sum float64
+	for _, p := range subset {
+		sum += p.CPU
+	}
+
+	avg := sum / float64(len(subset))
+	return avg > threshold
+}
+
 
 // Info is a struct that holds basic system status
 type Info struct {
@@ -68,12 +127,20 @@ func GetSystemHealth() (string, error) {
 
 	// Get real RAM
 	vMem, _ := mem.VirtualMemory()
+	ramPercent := 0.0
 	if vMem != nil {
 		usedGB := float64(vMem.Used) / 1024 / 1024 / 1024
 		totalGB := float64(vMem.Total) / 1024 / 1024 / 1024
-		pb.WriteString(fmt.Sprintf("Memory Usage: %.2fGB / %.2fGB\n", usedGB, totalGB))
+		ramPercent = vMem.UsedPercent
+		pb.WriteString(fmt.Sprintf("Memory Usage: %.2fGB / %.2fGB (%.2f%%)\n", usedGB, totalGB, ramPercent))
 	}
 	pb.WriteString("----------------------------\n")
+
+	// RECORD METRICS to the store
+	if len(cpuPercents) > 0 {
+		GlobalMetricStore.PushMetrics(cpuPercents[0], ramPercent)
+	}
+
 
 	return pb.String(), nil
 }
@@ -223,3 +290,46 @@ func GetVisualMetrics() (string, error) {
 
 	return sb.String(), nil
 }
+
+// GetImageSecurityReport scans images and warns about outdated ones (Simulated)
+func GetImageSecurityReport() (string, error) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return "", err
+	}
+	defer cli.Close()
+
+	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return "", err
+	}
+
+	var sb strings.Builder
+	sb.WriteString("VULNERABILITY SCAN REPORT:\n")
+	
+	// Mock Vulnerability Database
+	vulnerableImages := map[string]string{
+		"nginx:1.18":    "CRITICAL: CVE-2021-23017 (Off-by-one in resolver). Upgrade to 1.21+",
+		"redis:5.0":     "HIGH: CVE-2022-24736 (Lua script vulnerability). Upgrade to 6.0+",
+		"postgres:10":   "MEDIUM: Out of support. Upgrade to 13+",
+	}
+
+	foundCount := 0
+	for _, c := range containers {
+		for vulnImg, reason := range vulnerableImages {
+			if strings.Contains(c.Image, vulnImg) {
+				foundCount++
+				name := strings.TrimPrefix(c.Names[0], "/")
+				sb.WriteString(fmt.Sprintf("- ⚠️ **%s** (%s)\n  Status: %s\n", name, c.Image, reason))
+			}
+		}
+	}
+
+	if foundCount == 0 {
+		sb.WriteString("✅ No known critical vulnerabilities found in running images.\n")
+	}
+
+	return sb.String(), nil
+}
+

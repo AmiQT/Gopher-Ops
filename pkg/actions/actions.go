@@ -93,3 +93,16 @@ func GetContainerLogs(containerID string) (string, error) {
 
 	return buf.String(), nil
 }
+
+// InvestigateNetwork simulates checking connectivity for a container
+func InvestigateNetwork(containerID string) string {
+	// Mock: Check if container can reach google.com or similar
+	return "NETWORK ANALYSIS: Container can reach external network. No obvious DNS or Routing issues found."
+}
+
+// CheckConfig simulates a configuration validation check
+func CheckConfig(containerID string) string {
+	// Mock: Check common config files
+	return "CONFIG ANALYSIS: Found /etc/nginx/nginx.conf. Syntax is OK. No conflicting upstream rules detected."
+}
+
