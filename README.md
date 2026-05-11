@@ -21,6 +21,15 @@
 - **Robust CI/CD Pipeline:** Configured with **GitHub Actions** for automated Go unit testing and Terraform validation/formatting upon every push/PR.
 - **Zero-Trust & DevSecOps:** Hardcoded Telegram Chat ID gating ensuring only the authorized operator can execute commands. Includes **automated image vulnerability scanning** for outdated Docker tags/CVEs.
 
+## 🎮 Interactive Demo
+
+> **Self-Healing in Action:** Watch Gopher-Ops detect a crashed Redis node, analyze the root cause (RCA) via Gemini AI, and perform an automated restart.
+
+![Gopher-Ops Demo](assets/demo.mp4)
+*(Sila namakan video kau `demo.mp4` and letak dalam folder `assets/`!)*
+
+
+
 
 ## 🏗️ Architecture Workflow
 
@@ -87,6 +96,40 @@ Once the bot is running, simply PM it on Telegram to start managing your infrast
 - *"Bro, check system health jap"* -> Bot reads live CPU/RAM and lists the Terraform-provisioned containers.
 - *"List pods dalam cluster k8s aku"* -> Bot uses MCP to fetch real-time pod data from Kubernetes.
 - *"Kenapa pod database asyik restart?"* -> Bot triggers an automated `k8s-diagnose` workflow to find the root cause.
+
+## 📁 Project Structure
+
+```text
+.
+├── cmd/
+│   └── main.go           # Bot entry point & Telegram handler
+├── pkg/
+│   ├── actions/          # Docker & Terraform execution logic
+│   ├── ai/               # Gemini AI integration & prompt engineering
+│   ├── mcp/              # Model Context Protocol (K8s) manager
+│   └── monitor/          # System metrics & container tracking
+├── terraform/            # IaC for the microservices lab
+├── .github/workflows/    # CI/CD (Go tests & TF validation)
+├── demo-k8s.yaml         # Sample K8s manifest
+└── README.md             # You are here!
+```
+
+## 🗺️ Roadmap
+
+- [ ] **Multi-Cloud Support:** Integration with AWS/GCP metrics.
+- [ ] **Custom Personas:** Switch between "Chill Dev" and "Strict SRE" tones.
+- [ ] **Visual RCA:** Generate graphs for log patterns using AI.
+- [ ] **Voice Commands:** Support for Telegram Voice Notes.
+
+## 🤝 Contributing
+
+Contributions are welcome! Whether it's fixing a bug, adding a new tool, or improving the documentation:
+1. Fork the Project.
+2. Create your Feature Branch (`git checkout -b feature/AmazingFeature`).
+3. Commit your Changes (`git commit -m 'Add some AmazingFeature'`).
+4. Push to the Branch (`git push origin feature/AmazingFeature`).
+5. Open a Pull Request.
+
 
 ## 📜 Credits & Acknowledgments
 
