@@ -25,8 +25,10 @@
 
 > **Self-Healing in Action:** Watch Gopher-Ops detect a crashed Redis node, analyze the root cause (RCA) via Gemini AI, and perform an automated restart.
 
-![Gopher-Ops Demo](assets/demo.mp4)
-*(Sila namakan video kau `demo.mp4` and letak dalam folder `assets/`!)*
+
+https://github.com/user-attachments/assets/7f9d6055-ba37-4705-b883-1d394919bcf1
+
+
 
 
 
