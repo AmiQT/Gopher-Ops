@@ -306,6 +306,95 @@ func GetContainerStates() (map[string]ContainerStatus, error) {
 	return states, nil
 }
 
+// CrashContext holds Docker-level failure signals for a crashed container
+type CrashContext struct {
+	ExitCode     int
+	OOMKilled    bool
+	RestartCount int
+}
+
+// GetCrashContext fetches exit code, OOM flag, and restart count from Docker inspect
+func GetCrashContext(containerID string) (CrashContext, error) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return CrashContext{}, err
+	}
+	defer cli.Close()
+
+	inspect, err := cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return CrashContext{}, err
+	}
+
+	return CrashContext{
+		ExitCode:     inspect.State.ExitCode,
+		OOMKilled:    inspect.State.OOMKilled,
+		RestartCount: inspect.RestartCount,
+	}, nil
+}
+
+// FormatCrashContext returns a human-readable crash signal string for Gemini
+func FormatCrashContext(cc CrashContext) string {
+	exitReason := fmt.Sprintf("Exit Code: %d", cc.ExitCode)
+	switch cc.ExitCode {
+	case 137:
+		exitReason += " (OOMKilled — container ran out of memory)"
+	case 139:
+		exitReason += " (Segmentation fault)"
+	case 1:
+		exitReason += " (Application error)"
+	case 0:
+		exitReason += " (Clean exit — unexpected stop)"
+	}
+
+	oom := "No"
+	if cc.OOMKilled {
+		oom = "YES — container was killed by kernel OOM killer"
+	}
+
+	return fmt.Sprintf("--- CRASH SIGNALS ---\n%s\nOOM Killed: %s\nDocker Restart Count: %d\n", exitReason, oom, cc.RestartCount)
+}
+
+// PreCrashMetricsSummary returns the last `count` CPU/RAM data points as a readable string
+func PreCrashMetricsSummary(count int) string {
+	GlobalMetricStore.mu.RLock()
+	defer GlobalMetricStore.mu.RUnlock()
+
+	pts := GlobalMetricStore.Points
+	if len(pts) == 0 {
+		return ""
+	}
+	if len(pts) < count {
+		count = len(pts)
+	}
+	subset := pts[len(pts)-count:]
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("--- PRE-CRASH METRICS (last %d minutes) ---\n", count))
+	for _, p := range subset {
+		sb.WriteString(fmt.Sprintf("  [%s] CPU: %.1f%% | RAM: %.1f%%\n",
+			p.Timestamp.Format("15:04:05"), p.CPU, p.RAM))
+	}
+	return sb.String()
+}
+
+// IsContainerRunning checks if a container is currently in running state
+func IsContainerRunning(containerID string) bool {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return false
+	}
+	defer cli.Close()
+
+	inspect, err := cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return false
+	}
+	return inspect.State.Running
+}
+
 // CheckHTTP probes a URL, records latency history, and returns status
 func CheckHTTP(url string) URLStatus {
 	httpClient := http.Client{Timeout: 5 * time.Second}

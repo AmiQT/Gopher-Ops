@@ -418,7 +418,7 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 		}
 	}
 
-	// Token Saver: Cache for RCA results
+	// RCA cache — keyed by containerID:exitCode to avoid stale analysis across different failure modes
 	rcaCache := make(map[string]struct {
 		Result    string
 		Timestamp time.Time
@@ -439,6 +439,21 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 			log.Printf("📦 Dependency shift detected: %v", imageChanges)
 		}
 
+		// Cross-container correlation — collect all containers that just crashed this cycle
+		var freshCrashes []string
+		for id, current := range currentStates {
+			prev, exists := previousStates[id]
+			if exists && prev.State == "running" && current.State != "running" {
+				freshCrashes = append(freshCrashes, current.Name)
+			}
+		}
+		correlationCtx := ""
+		if len(freshCrashes) > 1 {
+			correlationCtx = fmt.Sprintf("--- CORRELATED CRASH EVENT ---\n%d containers crashed simultaneously this cycle: %s\nThis may indicate a shared upstream failure, network partition, or bad deploy.\n",
+				len(freshCrashes), strings.Join(freshCrashes, ", "))
+			log.Printf("🔗 Correlated crash detected: %v", freshCrashes)
+		}
+
 		autoPilot := os.Getenv("AUTOPILOT_ENABLED") == "true"
 
 		for id, current := range currentStates {
@@ -448,19 +463,25 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 			if exists && prev.State == "running" && current.State != "running" {
 				count := restartTracker[id]
 
+				// Fetch crash signals to build a unique cache key and enrich context
+				crashCtx, _ := monitor.GetCrashContext(id)
+				cacheKey := fmt.Sprintf("%s:%d", id, crashCtx.ExitCode)
+
 				if autoPilot && count < 3 {
 					// --- AUTO-PILOT MODE ---
 					restartTracker[id]++
 					log.Printf("🤖 Auto-Pilot: Attempt #%d for %s (%s).", restartTracker[id], current.Name, id)
 
-					// Token Saver: Check cache first
+					// Cache keyed by containerID:exitCode — different failure modes get fresh analysis
 					var analysis string
-					if cache, ok := rcaCache[id]; ok && time.Since(cache.Timestamp) < 10*time.Minute {
+					if cache, ok := rcaCache[cacheKey]; ok && time.Since(cache.Timestamp) < 10*time.Minute {
 						analysis = cache.Result + "\n\n*(Nota: Analisis dari cache 10 minit terakhir)*"
 					} else {
 						logs, _ := actions.GetContainerLogs(id)
 
-						// Build broader context for Gemini
+						// Build all cross-signal context for Gemini
+						crashSignals := monitor.FormatCrashContext(crashCtx)
+						precrashMetrics := monitor.PreCrashMetricsSummary(5)
 						upstreamCtx := monitor.GlobalURLMetricStore.UpstreamSummary()
 						networkCtx, _ := monitor.GetNetworkContext()
 						depCtx := ""
@@ -468,14 +489,31 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 							depCtx = "--- DEPENDENCY SHIFTS DETECTED ---\n" + strings.Join(imageChanges, "\n") + "\n"
 						}
 
-						analysis, _ = agent.DiagnoseIssue(current.Name, logs, upstreamCtx, depCtx, networkCtx)
-						rcaCache[id] = struct {
+						analysis, _ = agent.DiagnoseIssue(current.Name, logs,
+							crashSignals, precrashMetrics, upstreamCtx, depCtx, networkCtx, correlationCtx)
+						rcaCache[cacheKey] = struct {
 							Result    string
 							Timestamp time.Time
 						}{Result: analysis, Timestamp: time.Now()}
 					}
 
 					actions.RestartContainer(id)
+
+					// Post-restart health check after 15 seconds
+					go func(containerID, containerName string, attempt int, rcaAnalysis string) {
+						time.Sleep(15 * time.Second)
+						if monitor.IsContainerRunning(containerID) {
+							notif := fmt.Sprintf("✅ **AUTOPILOT: Restart Berjaya!**\n\nContainer **%s** dah running semula selepas attempt #%d.", containerName, attempt)
+							msg := tgbotapi.NewMessage(chatID, notif)
+							msg.ParseMode = "Markdown"
+							bot.Send(msg)
+						} else {
+							notif := fmt.Sprintf("💀 **AUTOPILOT: Restart Gagal!**\n\nContainer **%s** still DOWN selepas 15 saat (attempt #%d).\n\n**RCA:**\n%s\n\nIntervention manual diperlukan.", containerName, attempt, rcaAnalysis)
+							msg := tgbotapi.NewMessage(chatID, notif)
+							msg.ParseMode = "Markdown"
+							bot.Send(msg)
+						}
+					}(id, current.Name, restartTracker[id], analysis)
 
 					msgText := fmt.Sprintf("🤖 **AUTOPILOT ACTION! (Attempt %d/3)**\n\nContainer **%s** tadi DOWN. Aku dah tolong restartkan untuk kau!\n\n**Analisis AI:**\n%s", restartTracker[id], current.Name, analysis)
 					msg := tgbotapi.NewMessage(chatID, msgText)

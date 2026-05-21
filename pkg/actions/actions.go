@@ -64,7 +64,7 @@ func ClearCache() string {
 	return "System cache cleared successfully. Memory impact should decrease."
 }
 
-// GetContainerLogs fetches the last 10 lines of logs for a container
+// GetContainerLogs fetches the last 100 lines of logs for a container
 func GetContainerLogs(containerID string) (string, error) {
 	ctx := context.Background()
 	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
@@ -76,7 +76,7 @@ func GetContainerLogs(containerID string) (string, error) {
 	options := container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
-		Tail:       "10",
+		Tail:       "100",
 	}
 
 	out, err := cli.ContainerLogs(ctx, containerID, options)

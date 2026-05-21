@@ -24,6 +24,7 @@ type GeminiAgent struct {
 	client     *genai.Client
 	model      *genai.GenerativeModel
 	session    *genai.ChatSession
+	rcaModel   *genai.GenerativeModel // isolated model for RCA — never shares session with user chat
 	mcpManager *mcp.MCPManager
 }
 
@@ -97,10 +98,21 @@ func NewGeminiAgent(apiKey, modelType string) (*GeminiAgent, error) {
 	
 	session := model.StartChat()
 
+	// Dedicated model for RCA calls — lower temperature for more deterministic diagnosis,
+	// and never shares state with the user chat session.
+	rcaModel := client.GenerativeModel(modelType)
+	rcaModel.SetTemperature(0.2)
+	rcaModel.SystemInstruction = &genai.Content{
+		Parts: []genai.Part{
+			genai.Text("You are a Senior SRE diagnosing a production incident. Analyze all provided signals and return a concise root cause analysis in Bahasa Melayu. Be precise, technical, and actionable."),
+		},
+	}
+
 	return &GeminiAgent{
 		client:     client,
 		model:      model,
 		session:    session,
+		rcaModel:   rcaModel,
 		mcpManager: mcpMgr,
 	}, nil
 }
@@ -236,21 +248,21 @@ func (a *GeminiAgent) ResetSession() {
 	a.session = a.model.StartChat()
 }
 
-// DiagnoseIssue provides RCA for a container issue with enriched cross-signal context.
-// Optional extra context strings (upstream latency, dependency shifts, network config)
-// are appended to the prompt so Gemini can correlate beyond container logs alone.
+// DiagnoseIssue provides RCA using a dedicated isolated model so it never contaminates
+// the user chat session. Extra context signals (crash flags, metrics, upstream latency,
+// dependency shifts, network config) are all injected into a single one-shot prompt.
 func (a *GeminiAgent) DiagnoseIssue(containerName, logs string, extraContext ...string) (string, error) {
 	var sb strings.Builder
-	sb.WriteString(fmt.Sprintf("SYSTEM ALERT: Container \"%s\" has crashed.\n\nLOGS:\n%s\n", containerName, logs))
-	for _, ctx := range extraContext {
-		if ctx != "" {
+	sb.WriteString(fmt.Sprintf("PRODUCTION INCIDENT: Container \"%s\" has crashed.\n\nLOGS (last 100 lines):\n%s\n", containerName, logs))
+	for _, c := range extraContext {
+		if c != "" {
 			sb.WriteString("\n")
-			sb.WriteString(ctx)
+			sb.WriteString(c)
 		}
 	}
-	sb.WriteString("\nAnalisis semua signal di atas — logs container, latency upstream, perubahan dependency, dan konfigurasi network — kemudian berikan RCA yang ringkas dalam Bahasa Melayu.")
+	sb.WriteString("\nAnalisis semua signal di atas secara holistik — exit code, OOM flags, pre-crash metrics, upstream latency, dependency shifts, dan network config. Berikan RCA yang ringkas dan cadangan tindakan dalam Bahasa Melayu.")
 
-	resp, err := a.session.SendMessage(context.Background(), genai.Text(sb.String()))
+	resp, err := a.rcaModel.GenerateContent(context.Background(), genai.Text(sb.String()))
 	if err != nil {
 		return "", err
 	}
