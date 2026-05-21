@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"strings"
+	"time"
 
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
@@ -13,6 +14,37 @@ import (
 	"gopher-ops/pkg/mcp"
 	"gopher-ops/pkg/monitor"
 )
+
+// RCAResult is the structured output Gemini returns for every incident diagnosis
+type RCAResult struct {
+	RootCause         string `json:"root_cause"`
+	Severity          string `json:"severity"`           // LOW | MEDIUM | HIGH | CRITICAL
+	RecommendedAction string `json:"recommended_action"`
+	Confidence        string `json:"confidence"`          // LOW | MEDIUM | HIGH
+	Summary           string `json:"summary"`
+}
+
+// Format renders an RCAResult into a Telegram-friendly string
+func (r RCAResult) Format() string {
+	severityEmoji := map[string]string{
+		"LOW": "🟢", "MEDIUM": "🟡", "HIGH": "🟠", "CRITICAL": "🔴",
+	}
+	confidenceEmoji := map[string]string{
+		"LOW": "🤔", "MEDIUM": "🧐", "HIGH": "✅",
+	}
+	se := severityEmoji[r.Severity]
+	if se == "" {
+		se = "⚪"
+	}
+	ce := confidenceEmoji[r.Confidence]
+	if ce == "" {
+		ce = "🤔"
+	}
+	return fmt.Sprintf(
+		"**Punca:** %s\n**Severity:** %s %s\n**Keyakinan:** %s %s\n\n**Tindakan:**\n%s\n\n**Ringkasan:**\n%s",
+		r.RootCause, se, r.Severity, ce, r.Confidence, r.RecommendedAction, r.Summary,
+	)
+}
 
 // ActionIntent structured data for hitting the HITL (Human-in-the-loop)
 type ActionIntent struct {
@@ -98,14 +130,25 @@ func NewGeminiAgent(apiKey, modelType string) (*GeminiAgent, error) {
 	
 	session := model.StartChat()
 
-	// Dedicated model for RCA calls — lower temperature for more deterministic diagnosis,
-	// and never shares state with the user chat session.
+	// Dedicated model for RCA — isolated from user chat, enforces structured JSON output
 	rcaModel := client.GenerativeModel(modelType)
 	rcaModel.SetTemperature(0.2)
 	rcaModel.SystemInstruction = &genai.Content{
 		Parts: []genai.Part{
-			genai.Text("You are a Senior SRE diagnosing a production incident. Analyze all provided signals and return a concise root cause analysis in Bahasa Melayu. Be precise, technical, and actionable."),
+			genai.Text("You are a Senior SRE diagnosing a production incident. Analyze all provided signals and return structured JSON. All text fields must be in Bahasa Melayu. Be precise, technical, and actionable."),
 		},
+	}
+	rcaModel.ResponseMIMEType = "application/json"
+	rcaModel.ResponseSchema = &genai.Schema{
+		Type: genai.TypeObject,
+		Properties: map[string]*genai.Schema{
+			"root_cause":         {Type: genai.TypeString, Description: "Punca utama masalah"},
+			"severity":           {Type: genai.TypeString, Enum: []string{"LOW", "MEDIUM", "HIGH", "CRITICAL"}},
+			"recommended_action": {Type: genai.TypeString, Description: "Langkah-langkah tindakan yang disyorkan"},
+			"confidence":         {Type: genai.TypeString, Enum: []string{"LOW", "MEDIUM", "HIGH"}},
+			"summary":            {Type: genai.TypeString, Description: "Ringkasan insiden dalam 2-3 ayat"},
+		},
+		Required: []string{"root_cause", "severity", "recommended_action", "confidence", "summary"},
 	}
 
 	return &GeminiAgent{
@@ -248,9 +291,8 @@ func (a *GeminiAgent) ResetSession() {
 	a.session = a.model.StartChat()
 }
 
-// DiagnoseIssue provides RCA using a dedicated isolated model so it never contaminates
-// the user chat session. Extra context signals (crash flags, metrics, upstream latency,
-// dependency shifts, network config) are all injected into a single one-shot prompt.
+// DiagnoseIssue provides RCA using an isolated model with structured JSON output and
+// exponential-backoff retry. Never shares state with the user chat session.
 func (a *GeminiAgent) DiagnoseIssue(containerName, logs string, extraContext ...string) (string, error) {
 	var sb strings.Builder
 	sb.WriteString(fmt.Sprintf("PRODUCTION INCIDENT: Container \"%s\" has crashed.\n\nLOGS (last 100 lines):\n%s\n", containerName, logs))
@@ -260,13 +302,33 @@ func (a *GeminiAgent) DiagnoseIssue(containerName, logs string, extraContext ...
 			sb.WriteString(c)
 		}
 	}
-	sb.WriteString("\nAnalisis semua signal di atas secara holistik — exit code, OOM flags, pre-crash metrics, upstream latency, dependency shifts, dan network config. Berikan RCA yang ringkas dan cadangan tindakan dalam Bahasa Melayu.")
+	sb.WriteString("\nAnalisis semua signal di atas secara holistik dan kembalikan hasil dalam JSON schema yang ditetapkan.")
 
-	resp, err := a.rcaModel.GenerateContent(context.Background(), genai.Text(sb.String()))
-	if err != nil {
-		return "", err
+	prompt := sb.String()
+	var resp *genai.GenerateContentResponse
+	var err error
+
+	// Retry with exponential backoff on transient API failures
+	for attempt := 0; attempt < 3; attempt++ {
+		resp, err = a.rcaModel.GenerateContent(context.Background(), genai.Text(prompt))
+		if err == nil {
+			break
+		}
+		log.Printf("⚠️ RCA attempt %d failed: %v", attempt+1, err)
+		time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
 	}
-	return a.extractText(resp), nil
+	if err != nil {
+		return "", fmt.Errorf("RCA gagal selepas 3 percubaan: %w", err)
+	}
+
+	raw := a.extractText(resp)
+
+	// Parse structured JSON and format for Telegram
+	var result RCAResult
+	if jsonErr := json.Unmarshal([]byte(raw), &result); jsonErr != nil {
+		return raw, nil // fallback to raw text if parsing fails
+	}
+	return result.Format(), nil
 }
 
 // AuditSecurity provides a security assessment

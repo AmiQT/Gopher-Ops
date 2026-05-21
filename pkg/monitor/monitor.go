@@ -10,6 +10,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/client"
 	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/mem"
 	"sync"
 )
@@ -240,13 +241,13 @@ func GetSystemHealth() (string, error) {
 		ramPercent = vMem.UsedPercent
 		pb.WriteString(fmt.Sprintf("Memory Usage: %.2fGB / %.2fGB (%.2f%%)\n", usedGB, totalGB, ramPercent))
 	}
+	pb.WriteString(GetDiskUsage())
 	pb.WriteString("----------------------------\n")
 
 	// RECORD METRICS to the store
 	if len(cpuPercents) > 0 {
 		GlobalMetricStore.PushMetrics(cpuPercents[0], ramPercent)
 	}
-
 
 	return pb.String(), nil
 }
@@ -393,6 +394,99 @@ func IsContainerRunning(containerID string) bool {
 		return false
 	}
 	return inspect.State.Running
+}
+
+// GetDiskUsage returns disk usage for the root partition and Docker data root
+func GetDiskUsage() string {
+	var sb strings.Builder
+	sb.WriteString("--- DISK USAGE ---\n")
+
+	for _, path := range []string{"/", "/var/lib/docker"} {
+		usage, err := disk.Usage(path)
+		if err != nil {
+			continue
+		}
+		warning := ""
+		if usage.UsedPercent > 85 {
+			warning = " ⚠️ CRITICAL"
+		} else if usage.UsedPercent > 70 {
+			warning = " ⚠️ HIGH"
+		}
+		sb.WriteString(fmt.Sprintf("  %s: %.1f%% used (%.1fGB / %.1fGB)%s\n",
+			path,
+			usage.UsedPercent,
+			float64(usage.Used)/1024/1024/1024,
+			float64(usage.Total)/1024/1024/1024,
+			warning,
+		))
+	}
+	return sb.String()
+}
+
+// DependencyMap maps a container name to the list of container names it depends on.
+// Populated from the Docker label: gopher-ops.depends_on=svc1,svc2
+type DependencyMap map[string][]string
+
+// GetContainerDependencies reads Docker labels to build an inter-container dependency map
+func GetContainerDependencies() (DependencyMap, error) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, err
+	}
+	defer cli.Close()
+
+	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+
+	deps := make(DependencyMap)
+	for _, c := range containers {
+		name := strings.TrimPrefix(c.Names[0], "/")
+		if raw, ok := c.Labels["gopher-ops.depends_on"]; ok && raw != "" {
+			var depList []string
+			for _, d := range strings.Split(raw, ",") {
+				depList = append(depList, strings.TrimSpace(d))
+			}
+			deps[name] = depList
+		}
+	}
+	return deps, nil
+}
+
+// FormatCascadeContext checks if any of the crashed containers are depended upon by others,
+// and returns a human-readable cascade warning for the RCA prompt.
+func FormatCascadeContext(crashedNames []string, deps DependencyMap) string {
+	if len(crashedNames) == 0 || len(deps) == 0 {
+		return ""
+	}
+
+	crashed := make(map[string]bool)
+	for _, n := range crashedNames {
+		crashed[n] = true
+	}
+
+	var cascades []string
+	for svc, depList := range deps {
+		for _, dep := range depList {
+			if crashed[dep] {
+				cascades = append(cascades, fmt.Sprintf("%s depends on %s (which crashed)", svc, dep))
+			}
+		}
+	}
+
+	if len(cascades) == 0 {
+		return ""
+	}
+
+	var sb strings.Builder
+	sb.WriteString("--- DEPENDENCY CASCADE DETECTED ---\n")
+	for _, c := range cascades {
+		sb.WriteString("  " + c + "\n")
+	}
+	sb.WriteString("Crashes may be cascade failures, not independent root causes.\n")
+	return sb.String()
 }
 
 // CheckHTTP probes a URL, records latency history, and returns status

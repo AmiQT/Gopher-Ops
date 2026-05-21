@@ -1,21 +1,26 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net/http"
 	"os"
 	"strconv"
 	"strings"
-
-	"gopher-ops/pkg/actions"
-	"gopher-ops/pkg/ai"
-	"gopher-ops/pkg/monitor"
-
 	"sync"
 	"time"
 
+	"gopher-ops/pkg/actions"
+	"gopher-ops/pkg/ai"
+	"gopher-ops/pkg/audit"
+	"gopher-ops/pkg/monitor"
+
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
+	dockerclient "github.com/docker/docker/client"
+	dockertypes "github.com/docker/docker/api/types"
+	dockerfilters "github.com/docker/docker/api/types/filters"
 	"github.com/joho/godotenv"
 )
 
@@ -84,8 +89,11 @@ func main() {
 	bot.Debug = false
 	log.Printf("✅ Authorized on Telegram account %s", bot.Self.UserName)
 
-	// 3. Start Background Monitor
+	// 3. Start Background Monitor (metrics, HTTP probing, image snapshots)
 	go startBackgroundMonitor(bot, agent, authorizedChatID)
+
+	// 4. Start real-time Docker event listener for instant crash detection
+	go startDockerEventListener(bot, agent, authorizedChatID)
 
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
@@ -124,7 +132,7 @@ func main() {
 			case "start":
 				msgText = "🤖 **Gopher-Ops Ready!**\nSebut je apa kau nak aku buat kat server ni mat."
 			case "help":
-				msgText = "📖 **COMMANDS:**\n/start - Mula sembang\n/help - Tengok ni\n/status - Check bot & AI status\n/reset - Clear state"
+				msgText = "📖 **COMMANDS:**\n/start - Mula sembang\n/help - Tengok ni\n/status - Check bot & AI status\n/reset - Clear state\n/silence 30m - Pause autopilot alerts (guna 0m untuk cancel)"
 			case "status":
 				// Get live metrics for status
 				health, _ := monitor.GetSystemHealth()
@@ -141,9 +149,19 @@ func main() {
 					"📊 **Live Metrics:**\n%s",
 					strings.ToUpper(provider), model, autoPilot, health)
 			case "reset":
-				// Manual state reset via Telegram command
 				os.Remove("state.json")
 				msgText = "🧹 **STATE CLEARED!** Hafiz dah lupa sejarah lama. Kita mula hidup baru."
+			case "silence":
+				args := update.Message.CommandArguments()
+				duration, parseErr := time.ParseDuration(args)
+				if parseErr != nil || duration <= 0 {
+					msgText = "⚠️ Format salah. Guna: `/silence 30m` atau `/silence 1h`"
+				} else {
+					GlobalSilence.Set(duration)
+					audit.Log("manual", "Silence", "autopilot", fmt.Sprintf("silenced for %s", duration))
+					msgText = fmt.Sprintf("🔕 **Silence mode aktif selama %s.**\nAutopilot alerts di-pause sehingga `%s`.\nGuna /silence 0m untuk cancel.",
+						duration, GlobalSilence.Until().Format("15:04:05"))
+				}
 			default:
 				msgText = "Command apa tu mat? Aku tak faham ah. 😂"
 			}
@@ -365,6 +383,33 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 	bot.Send(msg)
 }
 
+// silenceState controls the maintenance/silence window for autopilot alerts
+type silenceState struct {
+	mu    sync.Mutex
+	until time.Time
+}
+
+func (s *silenceState) IsSilenced() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return time.Now().Before(s.until)
+}
+
+func (s *silenceState) Set(d time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.until = time.Now().Add(d)
+}
+
+func (s *silenceState) Until() time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.until
+}
+
+// GlobalSilence is the shared silence state accessible from command handlers and the monitor
+var GlobalSilence = &silenceState{}
+
 // startBackgroundMonitor checks system health every X minutes and alerts the user
 func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64) {
 	log.Println("🩺 Background monitor started...")
@@ -585,4 +630,153 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 		previousStates = currentStates
 		previousImages = currentImages
 	}
+}
+
+// startDockerEventListener replaces per-minute polling for crash detection with
+// Docker's real-time Events API — crashes are detected within seconds, not minutes.
+func startDockerEventListener(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64) {
+	log.Println("⚡ Docker event listener started...")
+
+	for {
+		if err := runDockerEventLoop(bot, agent, chatID); err != nil {
+			log.Printf("⚠️ Docker event loop error: %v — reconnecting in 5s", err)
+			time.Sleep(5 * time.Second)
+		}
+	}
+}
+
+func runDockerEventLoop(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64) error {
+	cli, err := dockerclient.NewClientWithOpts(dockerclient.FromEnv, dockerclient.WithAPIVersionNegotiation())
+	if err != nil {
+		return err
+	}
+	defer cli.Close()
+
+	filterArgs := dockerfilters.NewArgs()
+	filterArgs.Add("type", "container")
+	filterArgs.Add("event", "die")
+	filterArgs.Add("event", "oom")
+
+	msgCh, errCh := cli.Events(context.Background(), dockertypes.EventsOptions{Filters: filterArgs})
+
+	restartTracker := make(map[string]int)
+	rcaCache := make(map[string]struct {
+		Result    string
+		Timestamp time.Time
+	})
+
+	for {
+		select {
+		case msg := <-msgCh:
+			if GlobalSilence.IsSilenced() {
+				log.Printf("🔕 Silence active — skipping event for %s", msg.Actor.Attributes["name"])
+				continue
+			}
+
+			containerID := msg.Actor.ID
+			if len(containerID) > 8 {
+				containerID = containerID[:8]
+			}
+			containerName := msg.Actor.Attributes["name"]
+			autoPilot := os.Getenv("AUTOPILOT_ENABLED") == "true"
+			count := restartTracker[containerID]
+
+			// Fetch all context signals
+			crashCtx, _ := monitor.GetCrashContext(containerID)
+			cacheKey := fmt.Sprintf("%s:%d", containerID, crashCtx.ExitCode)
+
+			var analysis string
+			if cache, ok := rcaCache[cacheKey]; ok && time.Since(cache.Timestamp) < 10*time.Minute {
+				analysis = cache.Result + "\n\n*(Nota: Analisis dari cache 10 minit terakhir)*"
+			} else {
+				logs, _ := actions.GetContainerLogs(containerID)
+				crashSignals := monitor.FormatCrashContext(crashCtx)
+				precrashMetrics := monitor.PreCrashMetricsSummary(5)
+				upstreamCtx := monitor.GlobalURLMetricStore.UpstreamSummary()
+				networkCtx, _ := monitor.GetNetworkContext()
+				diskCtx := monitor.GetDiskUsage()
+
+				deps, _ := monitor.GetContainerDependencies()
+				cascadeCtx := monitor.FormatCascadeContext([]string{containerName}, deps)
+
+				analysis, _ = agent.DiagnoseIssue(containerName, logs,
+					crashSignals, precrashMetrics, upstreamCtx, networkCtx, diskCtx, cascadeCtx)
+				rcaCache[cacheKey] = struct {
+					Result    string
+					Timestamp time.Time
+				}{Result: analysis, Timestamp: time.Now()}
+			}
+
+			if autoPilot && count < 3 {
+				restartTracker[containerID]++
+				actions.RestartContainer(containerID)
+				audit.Log("autopilot", "RestartContainer", containerName, fmt.Sprintf("attempt %d", restartTracker[containerID]))
+
+				msgText := fmt.Sprintf("⚡ **REAL-TIME ALERT! AUTOPILOT (Attempt %d/3)**\n\nContainer **%s** baru je crash. Aku dah restart!\n\n**Analisis AI:**\n%s",
+					restartTracker[containerID], containerName, analysis)
+				m := tgbotapi.NewMessage(chatID, msgText)
+				m.ParseMode = "Markdown"
+				bot.Send(m)
+
+				// Post-restart health check
+				go func(cID, cName string, attempt int, rca string) {
+					time.Sleep(15 * time.Second)
+					if monitor.IsContainerRunning(cID) {
+						audit.Log("autopilot", "HealthCheck", cName, "recovered")
+						m := tgbotapi.NewMessage(chatID, fmt.Sprintf("✅ **%s** dah running semula (attempt #%d).", cName, attempt))
+						m.ParseMode = "Markdown"
+						bot.Send(m)
+					} else {
+						audit.Log("autopilot", "HealthCheck", cName, "still_down")
+						triggerEscalation(bot, chatID, cName, attempt, rca)
+					}
+				}(containerID, containerName, restartTracker[containerID], analysis)
+
+			} else {
+				audit.Log("monitor", "Alert", containerName, "manual_intervention_required")
+				alertMsg := fmt.Sprintf("⚡ **REAL-TIME CRASH DETECTED!**\n\nContainer **%s** baru crash!\n\n**Analisis AI:**\n%s\n\nNak aku restart?", containerName, analysis)
+				if count >= 3 {
+					alertMsg = fmt.Sprintf("🚨 **CRITICAL!** **%s** dah crash berkali-kali. Autopilot surrender. Kau kena intervene manual bro.\n\n**RCA:**\n%s", containerName, analysis)
+					triggerEscalation(bot, chatID, containerName, count, analysis)
+				}
+				m := tgbotapi.NewMessage(chatID, alertMsg)
+				m.ParseMode = "Markdown"
+				btnRestart := tgbotapi.NewInlineKeyboardButtonData("🔄 Restart Now", "RestartContainer:"+containerID)
+				btnRCA := tgbotapi.NewInlineKeyboardButtonData("🔍 RCA Detail", "AnalyzeRCA:"+containerID)
+				m.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(
+					tgbotapi.NewInlineKeyboardRow(btnRestart),
+					tgbotapi.NewInlineKeyboardRow(btnRCA),
+				)
+				bot.Send(m)
+			}
+
+		case err := <-errCh:
+			return err
+		}
+	}
+}
+
+// triggerEscalation sends a critical alert to Telegram and optionally to a webhook
+func triggerEscalation(bot *tgbotapi.BotAPI, chatID int64, containerName string, attempts int, rca string) {
+	msg := tgbotapi.NewMessage(chatID,
+		fmt.Sprintf("🚨 **ESCALATION ALERT!**\n\nContainer **%s** gagal recover selepas %d percubaan.\n\n**RCA:**\n%s\n\nIntervention manual diperlukan segera.", containerName, attempts, rca))
+	msg.ParseMode = "Markdown"
+	bot.Send(msg)
+
+	audit.Log("escalation", "EscalationAlert", containerName, fmt.Sprintf("failed after %d attempts", attempts))
+
+	// Post to webhook if configured
+	webhookURL := os.Getenv("ESCALATION_WEBHOOK_URL")
+	if webhookURL == "" {
+		return
+	}
+
+	payload := fmt.Sprintf(`{"container":"%s","attempts":%d,"rca":"%s"}`, containerName, attempts, rca)
+	resp, err := http.Post(webhookURL, "application/json", strings.NewReader(payload))
+	if err != nil {
+		log.Printf("⚠️ Escalation webhook failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	log.Printf("📣 Escalation webhook fired for %s — HTTP %d", containerName, resp.StatusCode)
 }
