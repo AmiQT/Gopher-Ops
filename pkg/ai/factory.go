@@ -10,8 +10,8 @@ type AIAgent interface {
 	ProcessRequest(userMsg string) (string, []ActionIntent, error)
 	// ResetSession clears the chat history
 	ResetSession()
-	// DiagnoseIssue provides RCA for a container issue
-	DiagnoseIssue(containerName, logs string) (string, error)
+	// DiagnoseIssue provides RCA for a container issue with optional extra context signals
+	DiagnoseIssue(containerName, logs string, extraContext ...string) (string, error)
 	// AuditSecurity provides a security assessment
 	AuditSecurity(ctxData, imageScanData string) (string, error)
 	// TriageIssue provides a deeper investigation flow

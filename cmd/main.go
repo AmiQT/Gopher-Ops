@@ -375,6 +375,13 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 		log.Printf("⚠️ Monitor error during init: %v", err)
 	}
 
+	// Snapshot image versions to detect dependency shifts between cycles
+	previousImages, err := monitor.GetImageSnapshot()
+	if err != nil {
+		log.Printf("⚠️ Monitor: failed to take initial image snapshot: %v", err)
+		previousImages = make(monitor.ImageSnapshot)
+	}
+
 	// Tracker for auto-restarts and alert cooldowns
 	restartTracker := make(map[string]int)
 	alertState := make(map[string]string)
@@ -425,6 +432,13 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 			continue
 		}
 
+		// Detect dependency/image shifts since last cycle
+		currentImages, _ := monitor.GetImageSnapshot()
+		imageChanges := monitor.DetectImageChanges(previousImages, currentImages)
+		if len(imageChanges) > 0 {
+			log.Printf("📦 Dependency shift detected: %v", imageChanges)
+		}
+
 		autoPilot := os.Getenv("AUTOPILOT_ENABLED") == "true"
 
 		for id, current := range currentStates {
@@ -445,7 +459,16 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 						analysis = cache.Result + "\n\n*(Nota: Analisis dari cache 10 minit terakhir)*"
 					} else {
 						logs, _ := actions.GetContainerLogs(id)
-						analysis, _ = agent.DiagnoseIssue(current.Name, logs)
+
+						// Build broader context for Gemini
+						upstreamCtx := monitor.GlobalURLMetricStore.UpstreamSummary()
+						networkCtx, _ := monitor.GetNetworkContext()
+						depCtx := ""
+						if len(imageChanges) > 0 {
+							depCtx = "--- DEPENDENCY SHIFTS DETECTED ---\n" + strings.Join(imageChanges, "\n") + "\n"
+						}
+
+						analysis, _ = agent.DiagnoseIssue(current.Name, logs, upstreamCtx, depCtx, networkCtx)
 						rcaCache[id] = struct {
 							Result    string
 							Timestamp time.Time
@@ -522,5 +545,6 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 		}
 
 		previousStates = currentStates
+		previousImages = currentImages
 	}
 }

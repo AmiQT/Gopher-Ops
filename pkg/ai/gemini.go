@@ -5,10 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
-	
+
 	"gopher-ops/pkg/mcp"
 	"gopher-ops/pkg/monitor"
 )
@@ -235,10 +236,21 @@ func (a *GeminiAgent) ResetSession() {
 	a.session = a.model.StartChat()
 }
 
-// DiagnoseIssue provides RCA for a container issue
-func (a *GeminiAgent) DiagnoseIssue(containerName, logs string) (string, error) {
-	prompt := fmt.Sprintf("SYSTEM ALERT: Container \"%s\" has crashed.\nLOGS:\n%s\nAnalyze and provide RCA in Bahasa Melayu.", containerName, logs)
-	resp, err := a.session.SendMessage(context.Background(), genai.Text(prompt))
+// DiagnoseIssue provides RCA for a container issue with enriched cross-signal context.
+// Optional extra context strings (upstream latency, dependency shifts, network config)
+// are appended to the prompt so Gemini can correlate beyond container logs alone.
+func (a *GeminiAgent) DiagnoseIssue(containerName, logs string, extraContext ...string) (string, error) {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("SYSTEM ALERT: Container \"%s\" has crashed.\n\nLOGS:\n%s\n", containerName, logs))
+	for _, ctx := range extraContext {
+		if ctx != "" {
+			sb.WriteString("\n")
+			sb.WriteString(ctx)
+		}
+	}
+	sb.WriteString("\nAnalisis semua signal di atas — logs container, latency upstream, perubahan dependency, dan konfigurasi network — kemudian berikan RCA yang ringkas dalam Bahasa Melayu.")
+
+	resp, err := a.session.SendMessage(context.Background(), genai.Text(sb.String()))
 	if err != nil {
 		return "", err
 	}

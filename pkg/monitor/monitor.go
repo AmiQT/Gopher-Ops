@@ -14,6 +14,112 @@ import (
 	"sync"
 )
 
+// URLMetricPoint stores a single latency probe result for an upstream endpoint
+type URLMetricPoint struct {
+	Timestamp  time.Time
+	URL        string
+	Latency    time.Duration
+	StatusCode int
+	IsUp       bool
+}
+
+// URLMetricStore holds latency history per URL
+type URLMetricStore struct {
+	mu      sync.RWMutex
+	Points  map[string][]URLMetricPoint
+	MaxSize int
+}
+
+// GlobalURLMetricStore is the in-memory latency history for all monitored URLs
+var GlobalURLMetricStore = &URLMetricStore{
+	Points:  make(map[string][]URLMetricPoint),
+	MaxSize: 60,
+}
+
+// Push records a new latency probe result
+func (s *URLMetricStore) Push(p URLMetricPoint) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.Points[p.URL] = append(s.Points[p.URL], p)
+	if len(s.Points[p.URL]) > s.MaxSize {
+		s.Points[p.URL] = s.Points[p.URL][1:]
+	}
+}
+
+// IsDegraded returns true if average latency over last `count` probes exceeds threshold,
+// even when the endpoint is technically returning 2xx responses.
+func (s *URLMetricStore) IsDegraded(url string, threshold time.Duration, count int) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	pts := s.Points[url]
+	if len(pts) < count {
+		return false
+	}
+	subset := pts[len(pts)-count:]
+	var total time.Duration
+	validCount := 0
+	for _, p := range subset {
+		if p.IsUp {
+			total += p.Latency
+			validCount++
+		}
+	}
+	if validCount == 0 {
+		return false
+	}
+	return total/time.Duration(validCount) > threshold
+}
+
+// UpstreamSummary returns a human-readable latency report for all monitored URLs
+func (s *URLMetricStore) UpstreamSummary() string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.Points) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	sb.WriteString("--- UPSTREAM LATENCY HISTORY ---\n")
+	for url, pts := range s.Points {
+		if len(pts) == 0 {
+			continue
+		}
+		last := pts[len(pts)-1]
+		var total time.Duration
+		upCount := 0
+		for _, p := range pts {
+			if p.IsUp {
+				total += p.Latency
+				upCount++
+			}
+		}
+		avgLatency := time.Duration(0)
+		if upCount > 0 {
+			avgLatency = total / time.Duration(upCount)
+		}
+		status := "UP"
+		if !last.IsUp {
+			status = "DOWN"
+		}
+		sb.WriteString(fmt.Sprintf("  %s | Status: %s | Last: %dms | Avg(%d samples): %dms\n",
+			url, status, last.Latency.Milliseconds(), len(pts), avgLatency.Milliseconds()))
+	}
+	return sb.String()
+}
+
+// ImageSnapshot maps container short ID to its current image reference
+type ImageSnapshot map[string]string
+
+// DetectImageChanges compares two snapshots and returns human-readable change strings
+func DetectImageChanges(prev, current ImageSnapshot) []string {
+	var changes []string
+	for id, curImage := range current {
+		if prevImage, ok := prev[id]; ok && prevImage != curImage {
+			changes = append(changes, fmt.Sprintf("Container %s: image changed %s → %s", id, prevImage, curImage))
+		}
+	}
+	return changes
+}
+
 // MetricPoint stores a single snapshot of system load
 type MetricPoint struct {
 	Timestamp time.Time
@@ -200,20 +306,93 @@ func GetContainerStates() (map[string]ContainerStatus, error) {
 	return states, nil
 }
 
-// CheckHTTP probes a URL and returns status
+// CheckHTTP probes a URL, records latency history, and returns status
 func CheckHTTP(url string) URLStatus {
-	client := http.Client{
-		Timeout: 5 * time.Second,
-	}
+	httpClient := http.Client{Timeout: 5 * time.Second}
 
-	resp, err := client.Get(url)
+	start := time.Now()
+	resp, err := httpClient.Get(url)
+	latency := time.Since(start)
+
+	var statusCode int
+	var isUp bool
 	if err != nil {
-		return URLStatus{URL: url, StatusCode: 0, IsUp: false}
+		statusCode = 0
+		isUp = false
+	} else {
+		defer resp.Body.Close()
+		statusCode = resp.StatusCode
+		isUp = statusCode >= 200 && statusCode < 400
 	}
-	defer resp.Body.Close()
 
-	isUp := resp.StatusCode >= 200 && resp.StatusCode < 400
-	return URLStatus{URL: url, StatusCode: resp.StatusCode, IsUp: isUp}
+	GlobalURLMetricStore.Push(URLMetricPoint{
+		Timestamp:  time.Now(),
+		URL:        url,
+		Latency:    latency,
+		StatusCode: statusCode,
+		IsUp:       isUp,
+	})
+
+	return URLStatus{URL: url, StatusCode: statusCode, IsUp: isUp}
+}
+
+// GetNetworkContext returns network configuration for all containers to enrich RCA context
+func GetNetworkContext() (string, error) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return "", err
+	}
+	defer cli.Close()
+
+	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return "", err
+	}
+
+	var sb strings.Builder
+	sb.WriteString("--- CONTAINER NETWORK CONFIG ---\n")
+	for _, c := range containers {
+		name := strings.TrimPrefix(c.Names[0], "/")
+		inspect, err := cli.ContainerInspect(ctx, c.ID)
+		if err != nil {
+			continue
+		}
+		sb.WriteString(fmt.Sprintf("Container: %s | NetworkMode: %s\n", name, inspect.HostConfig.NetworkMode))
+		if inspect.NetworkSettings != nil {
+			for netName, ep := range inspect.NetworkSettings.Networks {
+				sb.WriteString(fmt.Sprintf("  Network: %s | IP: %s | Gateway: %s\n", netName, ep.IPAddress, ep.Gateway))
+			}
+		}
+		if len(inspect.HostConfig.DNS) > 0 {
+			sb.WriteString(fmt.Sprintf("  DNS: %s\n", strings.Join(inspect.HostConfig.DNS, ", ")))
+		}
+		if len(c.Ports) > 0 {
+			sb.WriteString(fmt.Sprintf("  Ports: %v\n", c.Ports))
+		}
+	}
+	return sb.String(), nil
+}
+
+// GetImageSnapshot returns a map of container short ID → image reference for all containers
+func GetImageSnapshot() (ImageSnapshot, error) {
+	ctx := context.Background()
+	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	if err != nil {
+		return nil, err
+	}
+	defer cli.Close()
+
+	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
+	if err != nil {
+		return nil, err
+	}
+
+	snap := make(ImageSnapshot)
+	for _, c := range containers {
+		snap[c.ID[:8]] = c.Image
+	}
+	return snap, nil
 }
 
 // GetSecurityContext gathers security-related information for all containers

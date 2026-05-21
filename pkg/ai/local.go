@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
+
 	"gopher-ops/pkg/monitor"
 
 	"github.com/sashabaranov/go-openai"
@@ -97,10 +99,19 @@ func (a *LocalAgent) Close() {
 	// No specific cleanup needed for the openai client
 }
 
-// DiagnoseIssue provides RCA via local LLM
-func (a *LocalAgent) DiagnoseIssue(containerName, logs string) (string, error) {
+// DiagnoseIssue provides RCA via local LLM with optional extra context signals
+func (a *LocalAgent) DiagnoseIssue(containerName, logs string, extraContext ...string) (string, error) {
 	ctx := context.Background()
-	prompt := fmt.Sprintf("SYSTEM ALERT: Container \"%s\" issue analysis.\nLOGS:\n%s\n\nPlease provide RCA and fix steps in Bahasa Melayu.", containerName, logs)
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("SYSTEM ALERT: Container \"%s\" issue analysis.\nLOGS:\n%s\n", containerName, logs))
+	for _, c := range extraContext {
+		if c != "" {
+			sb.WriteString("\n")
+			sb.WriteString(c)
+		}
+	}
+	sb.WriteString("\nPlease provide RCA and fix steps in Bahasa Melayu.")
+	prompt := sb.String()
 	
 	resp, err := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: a.model,
