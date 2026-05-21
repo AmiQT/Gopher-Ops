@@ -331,20 +331,21 @@ func (a *GeminiAgent) DiagnoseIssue(containerName, logs string, extraContext ...
 	return result.Format(), nil
 }
 
-// AuditSecurity provides a security assessment
+// AuditSecurity provides a security assessment using the isolated rcaModel
+// so it never contaminates the user chat session.
 func (a *GeminiAgent) AuditSecurity(ctxData, imageScanData string) (string, error) {
-	prompt := fmt.Sprintf("SECURITY AUDIT REQUEST.\nCONTEXT:\n%s\nIMAGE DATA:\n%s\nAnalyze security in Bahasa Melayu.", ctxData, imageScanData)
-	resp, err := a.session.SendMessage(context.Background(), genai.Text(prompt))
+	prompt := fmt.Sprintf("SECURITY AUDIT REQUEST.\nCONTEXT:\n%s\nIMAGE DATA:\n%s\nAnalisis keselamatan secara menyeluruh dalam Bahasa Melayu dan berikan cadangan tindakan.", ctxData, imageScanData)
+	resp, err := a.rcaModel.GenerateContent(context.Background(), genai.Text(prompt))
 	if err != nil {
 		return "", err
 	}
 	return a.extractText(resp), nil
 }
 
-// TriageIssue provides a deeper investigation flow
+// TriageIssue provides deeper investigation using the isolated rcaModel.
 func (a *GeminiAgent) TriageIssue(containerName, triageType, data string) (string, error) {
-	prompt := fmt.Sprintf("TRIAGE REQUEST: %s\nTarget: %s\nData:\n%s\nPerform triage in Bahasa Melayu.", triageType, containerName, data)
-	resp, err := a.session.SendMessage(context.Background(), genai.Text(prompt))
+	prompt := fmt.Sprintf("TRIAGE REQUEST: %s\nTarget: %s\nData:\n%s\nLakukan triage secara teknikal dalam Bahasa Melayu.", triageType, containerName, data)
+	resp, err := a.rcaModel.GenerateContent(context.Background(), genai.Text(prompt))
 	if err != nil {
 		return "", err
 	}

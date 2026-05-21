@@ -144,3 +144,69 @@ func TestLog_ConcurrentWrites(t *testing.T) {
 		t.Errorf("expected 20 entries from concurrent writes, got %d", len(entries))
 	}
 }
+
+func TestReadLast_ReturnsNEntries(t *testing.T) {
+	tmpDir := t.TempDir()
+	origWD, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(origWD)
+
+	for i := 0; i < 15; i++ {
+		Log("autopilot", "RestartContainer", "svc", "ok")
+	}
+
+	last := ReadLast(10)
+	if len(last) != 10 {
+		t.Errorf("expected 10 entries from ReadLast(10), got %d", len(last))
+	}
+}
+
+func TestReadLast_FewerThanN(t *testing.T) {
+	tmpDir := t.TempDir()
+	origWD, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(origWD)
+
+	Log("manual", "Silence", "autopilot", "30m")
+	Log("manual", "Silence", "autopilot", "cancelled")
+
+	last := ReadLast(10)
+	if len(last) != 2 {
+		t.Errorf("expected 2 entries (all of them) from ReadLast(10), got %d", len(last))
+	}
+}
+
+func TestReadLast_EmptyFile(t *testing.T) {
+	tmpDir := t.TempDir()
+	origWD, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(origWD)
+
+	last := ReadLast(10)
+	if last != nil && len(last) != 0 {
+		t.Errorf("expected nil/empty from ReadLast on missing file, got %v", last)
+	}
+}
+
+func TestRotate_TriggersWhenOverLimit(t *testing.T) {
+	tmpDir := t.TempDir()
+	origWD, _ := os.Getwd()
+	os.Chdir(tmpDir)
+	defer os.Chdir(origWD)
+
+	// Write a file that exceeds maxBytes
+	bigData := make([]byte, maxBytes+1)
+	os.WriteFile(logFile, bigData, 0644)
+
+	// Log one more entry — should trigger rotation
+	Log("manual", "Test", "target", "result")
+
+	if _, err := os.Stat(backupFile); os.IsNotExist(err) {
+		t.Error("expected backup file to exist after rotation")
+	}
+	// New logFile should be small (just the new entry)
+	info, _ := os.Stat(logFile)
+	if info.Size() >= maxBytes {
+		t.Errorf("expected new logFile to be small after rotation, got %d bytes", info.Size())
+	}
+}

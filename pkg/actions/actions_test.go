@@ -35,3 +35,16 @@ func TestCheckConfig_ReturnsAnalysis(t *testing.T) {
 // GetContainerLogs, RestartContainer, StartContainer, StopContainer all require
 // a live Docker daemon — covered by integration tests, not unit tests.
 
+func TestScaleRedis_ReturnsMessage(t *testing.T) {
+	result, err := ScaleRedis(3)
+	if err != nil {
+		t.Errorf("unexpected error: %v", err)
+	}
+	if !strings.Contains(result, "3") {
+		t.Errorf("expected node count '3' in result, got: %q", result)
+	}
+}
+
+// TerraformPlan and TerraformApply require a real terraform binary and ./terraform dir —
+// covered by integration tests, not unit tests.
+
