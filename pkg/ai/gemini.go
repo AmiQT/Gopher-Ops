@@ -5,14 +5,41 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"os"
+	"time"
 
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
 
 	"gopher-ops/pkg/actions"
+	"gopher-ops/pkg/audit"
 	"gopher-ops/pkg/mcp"
 	"gopher-ops/pkg/monitor"
 )
+
+// aiTimeout caps every Gemini round-trip. Configurable via AI_TIMEOUT_SECONDS.
+var aiTimeout = func() time.Duration {
+	if v := os.Getenv("AI_TIMEOUT_SECONDS"); v != "" {
+		if n, err := time.ParseDuration(v + "s"); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 60 * time.Second
+}()
+
+// destructiveAllowed gates whether the AI can directly execute Stop/Restart
+// without human confirmation. Default is false (HITL required).
+func destructiveAllowed() bool {
+	return os.Getenv("AI_DESTRUCTIVE_ALLOWED") == "true"
+}
+
+func isDestructive(toolName string) bool {
+	switch toolName {
+	case "StopContainer", "RestartContainer":
+		return true
+	}
+	return false
+}
 
 // ActionIntent structured data for hitting the HITL (Human-in-the-loop)
 type ActionIntent struct {
@@ -155,13 +182,14 @@ func ConvertMCPSchemaToGenai(mcpSchema interface{}) *genai.Schema {
 
 // ProcessRequest handles the user query and automatic tool execution
 func (a *GeminiAgent) ProcessRequest(userMsg string) (string, []ActionIntent, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), aiTimeout)
+	defer cancel()
 	var intents []ActionIntent
 
 	// 1. Gather current context
 	health, _ := monitor.GetSystemHealth()
 	enrichedPrompt := fmt.Sprintf("```\n%s\n```\nOperator Query: %s", health, userMsg)
-	
+
 	// 2. Send Message to AI
 	resp, err := a.session.SendMessage(ctx, genai.Text(enrichedPrompt))
 	if err != nil {
@@ -226,31 +254,58 @@ func (a *GeminiAgent) ProcessRequest(userMsg string) (string, []ActionIntent, er
 // dispatchTool routes a Gemini function call to the correct backend.
 // Local Docker operations run through the actions package; everything else
 // falls through to the MCP manager (Kubernetes tools).
+//
+// Destructive operations are blocked unless AI_DESTRUCTIVE_ALLOWED=true.
+// In safe mode the AI is forced to route those actions through HITL buttons
+// (via ExtractIntents on its text response) instead of executing them directly.
 func (a *GeminiAgent) dispatchTool(ctx context.Context, name string, args map[string]any) (string, error) {
 	containerID, _ := args["containerID"].(string)
 
-	switch name {
-	case "RestartContainer":
-		if containerID == "" {
-			return "", fmt.Errorf("missing containerID")
-		}
-		return actions.RestartContainer(containerID)
-	case "StopContainer":
-		if containerID == "" {
-			return "", fmt.Errorf("missing containerID")
-		}
-		return actions.StopContainer(containerID)
-	case "GetContainerLogs":
-		if containerID == "" {
-			return "", fmt.Errorf("missing containerID")
-		}
-		return actions.GetContainerLogs(containerID)
-	default:
-		if a.mcpManager != nil {
-			return a.mcpManager.CallTool(ctx, name, args)
-		}
-		return "", fmt.Errorf("unknown tool: %s", name)
+	if isDestructive(name) && !destructiveAllowed() {
+		audit.Log(audit.Event{
+			Type: "ai_tool", Actor: "ai", Action: name, Target: containerID,
+			Status: "blocked", Detail: "destructive AI tool blocked — HITL required",
+		})
+		return "", fmt.Errorf("destructive tool %s is disabled (set AI_DESTRUCTIVE_ALLOWED=true to enable, or suggest the action in text for a confirmation button)", name)
 	}
+
+	result, err := func() (string, error) {
+		switch name {
+		case "RestartContainer":
+			if containerID == "" {
+				return "", fmt.Errorf("missing containerID")
+			}
+			return actions.RestartContainer(containerID)
+		case "StopContainer":
+			if containerID == "" {
+				return "", fmt.Errorf("missing containerID")
+			}
+			return actions.StopContainer(containerID)
+		case "GetContainerLogs":
+			if containerID == "" {
+				return "", fmt.Errorf("missing containerID")
+			}
+			return actions.GetContainerLogs(containerID)
+		default:
+			if a.mcpManager != nil {
+				return a.mcpManager.CallTool(ctx, name, args)
+			}
+			return "", fmt.Errorf("unknown tool: %s", name)
+		}
+	}()
+
+	status := "ok"
+	detail := ""
+	if err != nil {
+		status = "error"
+		detail = err.Error()
+	}
+	audit.Log(audit.Event{
+		Type: "ai_tool", Actor: "ai", Action: name, Target: containerID,
+		Status: status, Detail: detail,
+	})
+
+	return result, err
 }
 
 // ResetSession clears the conversation history to save tokens
@@ -258,30 +313,61 @@ func (a *GeminiAgent) ResetSession() {
 	a.session = a.model.StartChat()
 }
 
-// DiagnoseIssue provides RCA for a container issue
-func (a *GeminiAgent) DiagnoseIssue(containerName, logs string) (string, error) {
-	prompt := fmt.Sprintf("SYSTEM ALERT: Container \"%s\" has crashed.\nLOGS:\n%s\nAnalyze and provide RCA in Bahasa Melayu.", containerName, logs)
-	resp, err := a.session.SendMessage(context.Background(), genai.Text(prompt))
+// DiagnoseIssue performs root-cause analysis for a container failure.
+// The `evidence` argument is a pre-assembled bundle from the caller containing
+// the post-mortem inspect block, recent system metrics, and the log tail. The
+// prompt instructs the model to reason across all three rather than skim logs.
+func (a *GeminiAgent) DiagnoseIssue(containerName, evidence string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), aiTimeout)
+	defer cancel()
+
+	prompt := fmt.Sprintf(`SYSTEM ALERT: Container %q failed. Perform a DEEP root-cause analysis.
+
+You will receive three blocks of evidence:
+1. CONTAINER POST-MORTEM — inspect data (exit code, OOMKilled, restart count, health probes).
+2. SYSTEM METRICS — recent host CPU/RAM history.
+3. CONTAINER LOGS — the most recent log tail.
+
+Reasoning steps you MUST follow:
+- First, distinguish the failure CLASS: OOM kill, panic/segfault, healthcheck failure, dependency failure, configuration error, or clean exit.
+- Use the exit code, OOMKilled flag, and signal hints — do NOT trust logs alone.
+- Correlate timing in the logs with the system metric points provided.
+- Distinguish ROOT CAUSE from downstream SYMPTOMS (e.g. "connection refused" is usually a symptom, not the root).
+- If evidence is insufficient, say so explicitly and list what you'd need.
+
+%s
+
+Respond in Bahasa Melayu using this structure:
+- **Failure Class:** <one line>
+- **Root Cause:** <2-3 sentences, specific>
+- **Evidence:** <bullet list of the specific data points that support your conclusion>
+- **Recommended Action:** <concrete fix, not generic advice>`, containerName, evidence)
+
+	resp, err := a.session.SendMessage(ctx, genai.Text(prompt))
 	if err != nil {
 		return "", err
 	}
 	return a.extractText(resp), nil
 }
 
-// AuditSecurity provides a security assessment
+// AuditSecurity provides a security assessment.
 func (a *GeminiAgent) AuditSecurity(ctxData, imageScanData string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), aiTimeout)
+	defer cancel()
 	prompt := fmt.Sprintf("SECURITY AUDIT REQUEST.\nCONTEXT:\n%s\nIMAGE DATA:\n%s\nAnalyze security in Bahasa Melayu.", ctxData, imageScanData)
-	resp, err := a.session.SendMessage(context.Background(), genai.Text(prompt))
+	resp, err := a.session.SendMessage(ctx, genai.Text(prompt))
 	if err != nil {
 		return "", err
 	}
 	return a.extractText(resp), nil
 }
 
-// TriageIssue provides a deeper investigation flow
+// TriageIssue provides a deeper investigation flow.
 func (a *GeminiAgent) TriageIssue(containerName, triageType, data string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), aiTimeout)
+	defer cancel()
 	prompt := fmt.Sprintf("TRIAGE REQUEST: %s\nTarget: %s\nData:\n%s\nPerform triage in Bahasa Melayu.", triageType, containerName, data)
-	resp, err := a.session.SendMessage(context.Background(), genai.Text(prompt))
+	resp, err := a.session.SendMessage(ctx, genai.Text(prompt))
 	if err != nil {
 		return "", err
 	}

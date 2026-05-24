@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -15,11 +16,40 @@ import (
 
 	"gopher-ops/pkg/actions"
 	"gopher-ops/pkg/ai"
+	"gopher-ops/pkg/audit"
 	"gopher-ops/pkg/monitor"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 )
+
+const (
+	stateFile       = "state.json"
+	defaultRCALines = 200
+	rcaCacheTTL     = 1 * time.Hour
+)
+
+// markdownEscaper neutralizes Telegram Markdown specials in untrusted strings
+// (container names, log payloads) so a crafted log line cannot break rendering
+// or smuggle formatting into operator alerts.
+var markdownEscaper = strings.NewReplacer(
+	"_", "\\_",
+	"*", "\\*",
+	"`", "\\`",
+	"[", "\\[",
+)
+
+func safeMD(s string) string { return markdownEscaper.Replace(s) }
+
+// atomicWriteFile writes via tmp + rename so a crash mid-write cannot leave a
+// half-written state.json that would corrupt the next boot.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
+	}
+	return os.Rename(tmp, filepath.Clean(path))
+}
 
 func main() {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
@@ -31,6 +61,11 @@ func main() {
 	if err := godotenv.Load(); err != nil {
 		slog.Warn("No .env file found — credentials must be set via environment")
 	}
+
+	if p := os.Getenv("AUDIT_LOG_PATH"); p != "" {
+		audit.SetPath(p)
+	}
+	audit.Log(audit.Event{Type: "boot", Actor: "system", Status: "ok"})
 
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
@@ -73,6 +108,13 @@ func main() {
 	if v := os.Getenv("METRICS_HISTORY_SIZE"); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			monitor.SetMetricsHistorySize(n)
+		}
+	}
+
+	alertCooldown := 15 * time.Minute
+	if v := os.Getenv("ALERT_COOLDOWN_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			alertCooldown = time.Duration(n) * time.Minute
 		}
 	}
 
@@ -126,7 +168,7 @@ func main() {
 						slog.Error("🔥 Background monitor panicked — restarting", "panic", r)
 					}
 				}()
-				startBackgroundMonitor(ctx, bot, agent, authorizedChatID, cpuThreshold, cpuDuration)
+				startBackgroundMonitor(ctx, bot, agent, authorizedChatID, cpuThreshold, cpuDuration, alertCooldown)
 			}()
 
 			select {
@@ -147,6 +189,7 @@ func main() {
 		select {
 		case <-ctx.Done():
 			slog.Info("🛑 Shutdown signal received — stopping bot")
+			audit.Log(audit.Event{Type: "shutdown", Actor: "system", Status: "ok"})
 			bot.StopReceivingUpdates()
 			return
 		case update, ok := <-updates:
@@ -295,10 +338,19 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 	action := parts[0]
 	target := parts[1]
 
+	auditAction := func(act, tgt string, err error) {
+		status, detail := "ok", ""
+		if err != nil {
+			status, detail = "error", err.Error()
+		}
+		audit.Log(audit.Event{Type: "action", Actor: "user", Action: act, Target: tgt, Status: status, Detail: detail})
+	}
+
 	var resMsg string
 	switch action {
 	case "StopContainer":
 		_, err := actions.StopContainer(target)
+		auditAction(action, target, err)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ GG! Takleh stop %s: %v", target, err)
 		} else {
@@ -306,6 +358,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		}
 	case "StartContainer":
 		_, err := actions.StartContainer(target)
+		auditAction(action, target, err)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ GG! Takleh start %s: %v", target, err)
 		} else {
@@ -313,6 +366,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		}
 	case "RestartContainer":
 		_, err := actions.RestartContainer(target)
+		auditAction(action, target, err)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ GG! Takleh restart %s: %v", target, err)
 		} else {
@@ -320,27 +374,29 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		}
 	case "ClearCache":
 		res := actions.ClearCache()
+		auditAction(action, "", nil)
 		resMsg = fmt.Sprintf("✅ Selesai! %s 🧹", res)
 	case "ViewLogs":
 		logs, err := actions.GetContainerLogs(target)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ GG! Takleh tarik log %s: %v", target, err)
 		} else {
-			resMsg = fmt.Sprintf("📜 **Logs for %s:**\n```\n%s\n```", target, logs)
+			resMsg = fmt.Sprintf("📜 **Logs for %s:**\n```\n%s\n```", safeMD(target), logs)
 		}
 	case "AnalyzeRCA":
-		logs, _ := actions.GetContainerLogs(target)
 		name := monitor.GetContainerName(target)
 
 		msgProc := tgbotapi.NewMessage(callback.Message.Chat.ID, "🔍 *Gopher-Ops sedang menganalisis log... Sabar jap.*")
 		msgProc.ParseMode = "Markdown"
 		bot.Send(msgProc)
 
-		analysis, err := agent.DiagnoseIssue(name, logs)
+		evidence := buildRCAEvidence(target)
+		analysis, err := agent.DiagnoseIssue(name, evidence)
+		auditAction("AnalyzeRCA", target, err)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ Aduh, AI pening nak analyze: %v", err)
 		} else {
-			resMsg = fmt.Sprintf("🧐 **ANALISIS RCA: %s**\n\n%s", name, analysis)
+			resMsg = fmt.Sprintf("🧐 **ANALISIS RCA: %s**\n\n%s", safeMD(name), analysis)
 		}
 	case "TerraformApply":
 		out, err := actions.TerraformApply()
@@ -402,9 +458,46 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 	bot.Send(msg)
 }
 
+// buildRCAEvidence assembles the inspect post-mortem, system metric snapshot,
+// and a deep log tail into a single text bundle for the AI. This is what
+// upgrades RCA from "guess from 10 log lines" to "reason about exit codes,
+// OOM flags, restart history, system load, and 200 lines of context."
+func buildRCAEvidence(containerID string) string {
+	rcaLines := defaultRCALines
+	if v := os.Getenv("RCA_LOG_LINES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			rcaLines = n
+		}
+	}
+
+	var sb strings.Builder
+
+	if crash, err := monitor.GetCrashContext(containerID); err == nil {
+		sb.WriteString(crash.FormatForAI())
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString("=== CONTAINER POST-MORTEM ===\n(inspect unavailable: " + err.Error() + ")\n\n")
+	}
+
+	sb.WriteString(monitor.GetMetricsSnapshot(15))
+	sb.WriteString("\n")
+
+	logs, err := actions.GetContainerLogsN(containerID, rcaLines)
+	if err != nil {
+		sb.WriteString("=== CONTAINER LOGS ===\n(unavailable: " + err.Error() + ")\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("=== CONTAINER LOGS (last %d lines) ===\n%s\n", rcaLines, logs))
+	}
+
+	return sb.String()
+}
+
 // startBackgroundMonitor checks system health every minute and alerts the user.
-func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64, cpuThreshold float64, cpuDuration int) {
-	slog.Info("🩺 Background monitor started", "cpu_threshold", cpuThreshold, "cpu_duration_min", cpuDuration)
+func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64, cpuThreshold float64, cpuDuration int, alertCooldown time.Duration) {
+	slog.Info("🩺 Background monitor started",
+		"cpu_threshold", cpuThreshold,
+		"cpu_duration_min", cpuDuration,
+		"alert_cooldown", alertCooldown)
 
 	previousStates, err := monitor.GetContainerStates()
 	if err != nil {
@@ -414,6 +507,7 @@ func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.
 
 	restartTracker := make(map[string]int)
 	alertState := make(map[string]string)
+	alertSentAt := make(map[string]time.Time)
 
 	var mu sync.Mutex
 	saveState := func() {
@@ -421,25 +515,39 @@ func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.
 		defer mu.Unlock()
 
 		state := struct {
-			Restarts map[string]int    `json:"restarts"`
-			Alerts   map[string]string `json:"alerts"`
+			Restarts    map[string]int       `json:"restarts"`
+			Alerts      map[string]string    `json:"alerts"`
+			AlertSentAt map[string]time.Time `json:"alert_sent_at"`
 		}{
-			Restarts: restartTracker,
-			Alerts:   alertState,
+			Restarts:    restartTracker,
+			Alerts:      alertState,
+			AlertSentAt: alertSentAt,
 		}
 		data, _ := json.Marshal(state)
-		os.WriteFile("state.json", data, 0644)
+		if err := atomicWriteFile(stateFile, data, 0644); err != nil {
+			slog.Warn("state.json write failed", "error", err)
+		}
 	}
 
-	if file, err := os.ReadFile("state.json"); err == nil {
+	if file, err := os.ReadFile(stateFile); err == nil {
 		var state struct {
-			Restarts map[string]int    `json:"restarts"`
-			Alerts   map[string]string `json:"alerts"`
+			Restarts    map[string]int       `json:"restarts"`
+			Alerts      map[string]string    `json:"alerts"`
+			AlertSentAt map[string]time.Time `json:"alert_sent_at"`
 		}
 		if err := json.Unmarshal(file, &state); err == nil {
-			restartTracker = state.Restarts
-			alertState = state.Alerts
+			if state.Restarts != nil {
+				restartTracker = state.Restarts
+			}
+			if state.Alerts != nil {
+				alertState = state.Alerts
+			}
+			if state.AlertSentAt != nil {
+				alertSentAt = state.AlertSentAt
+			}
 			slog.Info("💾 State loaded from state.json")
+		} else {
+			slog.Warn("state.json corrupt — starting fresh", "error", err)
 		}
 	}
 
@@ -465,10 +573,23 @@ func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.
 			continue
 		}
 
+		// Evict RCA cache entries that are stale OR refer to containers that
+		// no longer exist. Without this, the cache grows unboundedly.
+		for k, v := range rcaCache {
+			if time.Since(v.Timestamp) > rcaCacheTTL {
+				delete(rcaCache, k)
+				continue
+			}
+			if _, alive := currentStates[k]; !alive {
+				delete(rcaCache, k)
+			}
+		}
+
 		autoPilot := os.Getenv("AUTOPILOT_ENABLED") == "true"
 
 		for id, current := range currentStates {
 			prev, exists := previousStates[id]
+			safeName := safeMD(current.Name)
 
 			if exists && prev.State == "running" && current.State != "running" {
 				count := restartTracker[id]
@@ -476,17 +597,22 @@ func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.
 				if autoPilot && count < 3 {
 					restartTracker[id]++
 					slog.Info("🤖 Auto-Pilot restart", "attempt", restartTracker[id], "container", current.Name, "id", id)
+					audit.Log(audit.Event{
+						Type: "autopilot", Actor: "ai", Action: "RestartContainer",
+						Target: id, Status: "info",
+						Detail: fmt.Sprintf("attempt %d/3 for %s", restartTracker[id], current.Name),
+					})
 
 					var analysis string
 					if cache, ok := rcaCache[id]; ok && time.Since(cache.Timestamp) < 10*time.Minute {
 						analysis = cache.Result + "\n\n*(Nota: Analisis dari cache 10 minit terakhir)*"
 					} else {
-						logs, _ := actions.GetContainerLogs(id)
+						evidence := buildRCAEvidence(id)
 						var diagErr error
-						analysis, diagErr = agent.DiagnoseIssue(current.Name, logs)
+						analysis, diagErr = agent.DiagnoseIssue(current.Name, evidence)
 						if diagErr != nil {
 							slog.Warn("DiagnoseIssue failed during autopilot", "container", current.Name, "error", diagErr)
-							analysis = "*(Analisis AI tidak tersedia)*"
+							analysis = "*(Analisis AI tidak tersedia: " + safeMD(diagErr.Error()) + ")*"
 						}
 						rcaCache[id] = struct {
 							Result    string
@@ -494,22 +620,35 @@ func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.
 						}{Result: analysis, Timestamp: time.Now()}
 					}
 
-					actions.RestartContainer(id)
+					if _, restartErr := actions.RestartContainer(id); restartErr != nil {
+						slog.Warn("Autopilot restart failed", "container", current.Name, "error", restartErr)
+						audit.Log(audit.Event{
+							Type: "autopilot", Actor: "ai", Action: "RestartContainer",
+							Target: id, Status: "error", Detail: restartErr.Error(),
+						})
+					}
 
-					msgText := fmt.Sprintf("🤖 **AUTOPILOT ACTION! (Attempt %d/3)**\n\nContainer **%s** tadi DOWN. Aku dah tolong restartkan untuk kau!\n\n**Analisis AI:**\n%s", restartTracker[id], current.Name, analysis)
+					msgText := fmt.Sprintf("🤖 **AUTOPILOT ACTION! (Attempt %d/3)**\n\nContainer **%s** tadi DOWN. Aku dah tolong restartkan untuk kau!\n\n**Analisis AI:**\n%s",
+						restartTracker[id], safeName, analysis)
 					msg := tgbotapi.NewMessage(chatID, msgText)
 					msg.ParseMode = "Markdown"
 					bot.Send(msg)
 					alertState[id] = "autopilot_sent"
+					alertSentAt[id] = time.Now()
 					saveState()
-				} else if alertState[id] != "alert_sent" {
+				} else if shouldAlert(alertState[id], alertSentAt[id], alertCooldown) {
 					alertMsg := ""
 					if count >= 3 {
-						alertMsg = fmt.Sprintf("🚨 **CRITICAL ALERT!**\n\nContainer **%s** dah restart 3 kali tapi still DOWN mat. 💀 Aku dah 'surrender'. Kau kena check manual jap bro.", current.Name)
+						alertMsg = fmt.Sprintf("🚨 **CRITICAL ALERT!**\n\nContainer **%s** dah restart 3 kali tapi still DOWN mat. 💀 Aku dah 'surrender'. Kau kena check manual jap bro.", safeName)
 					} else {
-						alertMsg = fmt.Sprintf("⚠️ **ALERT!** Container **%s** dah **DOWN**! (Status: %s)\nNak aku restart ke bro?", current.Name, current.State)
+						alertMsg = fmt.Sprintf("⚠️ **ALERT!** Container **%s** dah **DOWN**! (Status: %s)\nNak aku restart ke bro?", safeName, safeMD(current.State))
 					}
 					alertState[id] = "alert_sent"
+					alertSentAt[id] = time.Now()
+					audit.Log(audit.Event{
+						Type: "alert", Actor: "system", Action: "container_down",
+						Target: id, Status: "info", Detail: current.Name,
+					})
 
 					msg := tgbotapi.NewMessage(chatID, alertMsg)
 					msg.ParseMode = "Markdown"
@@ -557,4 +696,19 @@ func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.
 
 		previousStates = currentStates
 	}
+}
+
+// shouldAlert returns true when a fresh alert for `id` is allowed. It rate
+// limits repeat alerts so a flapping container cannot spam the operator.
+//   - first failure (status == ""): always alert
+//   - same failure within cooldown: suppress
+//   - same failure after cooldown elapsed: re-alert
+func shouldAlert(status string, lastSent time.Time, cooldown time.Duration) bool {
+	if status == "" {
+		return true
+	}
+	if lastSent.IsZero() {
+		return true
+	}
+	return time.Since(lastSent) > cooldown
 }

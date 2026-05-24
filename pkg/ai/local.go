@@ -3,7 +3,8 @@ package ai
 import (
 	"context"
 	"fmt"
-	"log"
+	"log/slog"
+
 	"gopher-ops/pkg/monitor"
 
 	"github.com/sashabaranov/go-openai"
@@ -37,12 +38,13 @@ func NewLocalAgent(cfg Config) (*LocalAgent, error) {
 }
 
 func (a *LocalAgent) ProcessRequest(userMsg string) (string, []ActionIntent, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), aiTimeout)
+	defer cancel()
 
 	// 1. Gather current context limits/metrics
 	health, err := monitor.GetSystemHealth()
 	if err != nil {
-		log.Printf("⚠️ Monitor warning: %v", err)
+		slog.Warn("Monitor unavailable for local LLM context", "error", err)
 		health = "System health data currently unavailable due to Docker connection issue."
 	}
 
@@ -79,7 +81,7 @@ func (a *LocalAgent) ProcessRequest(userMsg string) (string, []ActionIntent, err
 	// 3. Extract Actions
 	intents := ExtractIntents(output)
 
-	log.Printf("[OBSERVABILITY-LOCAL] Request processed via %s", a.model)
+	slog.Info("Local LLM request processed", "model", a.model)
 
 	return output, intents, nil
 }
@@ -97,11 +99,34 @@ func (a *LocalAgent) Close() {
 	// No specific cleanup needed for the openai client
 }
 
-// DiagnoseIssue provides RCA via local LLM
-func (a *LocalAgent) DiagnoseIssue(containerName, logs string) (string, error) {
-	ctx := context.Background()
-	prompt := fmt.Sprintf("SYSTEM ALERT: Container \"%s\" issue analysis.\nLOGS:\n%s\n\nPlease provide RCA and fix steps in Bahasa Melayu.", containerName, logs)
-	
+// DiagnoseIssue performs deep root-cause analysis via the local LLM. The
+// `evidence` argument should already contain the inspect post-mortem, recent
+// system metrics, and the log tail.
+func (a *LocalAgent) DiagnoseIssue(containerName, evidence string) (string, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), aiTimeout)
+	defer cancel()
+
+	prompt := fmt.Sprintf(`SYSTEM ALERT: Container %q failed. Perform a DEEP root-cause analysis.
+
+Evidence blocks provided below:
+1. CONTAINER POST-MORTEM (exit code, OOMKilled, restart count, health probes).
+2. SYSTEM METRICS (recent host CPU/RAM).
+3. CONTAINER LOGS (most recent tail).
+
+Reasoning steps:
+- Identify the failure CLASS: OOM, panic/segfault, healthcheck, dependency, configuration, or clean exit.
+- Trust the exit code, OOMKilled flag, and signal hints — not just log messages.
+- Distinguish ROOT CAUSE from downstream SYMPTOMS.
+- If evidence is insufficient, say so.
+
+%s
+
+Reply in Bahasa Melayu using:
+- **Failure Class:**
+- **Root Cause:**
+- **Evidence:**
+- **Recommended Action:**`, containerName, evidence)
+
 	resp, err := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: a.model,
 		Messages: []openai.ChatCompletionMessage{
@@ -115,11 +140,12 @@ func (a *LocalAgent) DiagnoseIssue(containerName, logs string) (string, error) {
 	return resp.Choices[0].Message.Content, nil
 }
 
-// AuditSecurity provides assessment via local LLM
+// AuditSecurity provides assessment via local LLM.
 func (a *LocalAgent) AuditSecurity(ctxData, imageScanData string) (string, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), aiTimeout)
+	defer cancel()
 	prompt := fmt.Sprintf("SECURITY AUDIT REQUEST.\nCONTAINER DATA:\n%s\nIMAGE VULN DATA:\n%s\n\nPlease provide security score and hardening steps in Bahasa Melayu.", ctxData, imageScanData)
-	
+
 	resp, err := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: a.model,
 		Messages: []openai.ChatCompletionMessage{
@@ -133,11 +159,12 @@ func (a *LocalAgent) AuditSecurity(ctxData, imageScanData string) (string, error
 	return resp.Choices[0].Message.Content, nil
 }
 
-// TriageIssue provides a deeper investigation flow via local LLM
+// TriageIssue provides a deeper investigation flow via local LLM.
 func (a *LocalAgent) TriageIssue(containerName, triageType, data string) (string, error) {
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), aiTimeout)
+	defer cancel()
 	prompt := fmt.Sprintf("SRE TRIAGE REQUEST.\nTarget: %s\nType: %s\nData:\n%s\n\nPlease provide investigation findings in Bahasa Melayu.", containerName, triageType, data)
-	
+
 	resp, err := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 		Model: a.model,
 		Messages: []openai.ChatCompletionMessage{

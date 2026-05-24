@@ -71,7 +71,18 @@ func ClearCache() string {
 }
 
 // GetContainerLogs fetches the last 10 lines of logs for a container.
+// Suitable for the "📜 View Logs" Telegram button where brevity matters.
 func GetContainerLogs(containerID string) (string, error) {
+	return GetContainerLogsN(containerID, 10)
+}
+
+// GetContainerLogsN fetches the last `lines` lines of logs. Used by the RCA
+// pipeline which needs much deeper context than the view-logs button.
+func GetContainerLogsN(containerID string, lines int) (string, error) {
+	if lines <= 0 {
+		lines = 10
+	}
+
 	cli, err := docker.Get()
 	if err != nil {
 		return "", fmt.Errorf("failed to get docker client: %w", err)
@@ -83,7 +94,7 @@ func GetContainerLogs(containerID string) (string, error) {
 	options := container.LogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
-		Tail:       "10",
+		Tail:       fmt.Sprint(lines),
 	}
 
 	out, err := cli.ContainerLogs(ctx, containerID, options)
