@@ -190,8 +190,13 @@ func (a *GeminiAgent) ProcessRequest(userMsg string) (string, []ActionIntent, er
 	health, _ := monitor.GetSystemHealth()
 	enrichedPrompt := fmt.Sprintf("```\n%s\n```\nOperator Query: %s", health, userMsg)
 
-	// 2. Send Message to AI
-	resp, err := a.session.SendMessage(ctx, genai.Text(enrichedPrompt))
+	// 2. Send Message to AI with retry
+	var resp *genai.GenerateContentResponse
+	err := withRetry(ctx, func() error {
+		r, e := a.session.SendMessage(ctx, genai.Text(enrichedPrompt))
+		resp = r
+		return e
+	})
 	if err != nil {
 		return "", intents, err
 	}
@@ -229,7 +234,11 @@ func (a *GeminiAgent) ProcessRequest(userMsg string) (string, []ActionIntent, er
 		}
 
 		// Send results back to AI to get final response or next tool call
-		resp, err = a.session.SendMessage(ctx, toolResults...)
+		err = withRetry(ctx, func() error {
+			r, e := a.session.SendMessage(ctx, toolResults...)
+			resp = r
+			return e
+		})
 		if err != nil {
 			return "", intents, err
 		}
@@ -343,7 +352,7 @@ Respond in Bahasa Melayu using this structure:
 - **Evidence:** <bullet list of the specific data points that support your conclusion>
 - **Recommended Action:** <concrete fix, not generic advice>`, containerName, evidence)
 
-	resp, err := a.session.SendMessage(ctx, genai.Text(prompt))
+	resp, err := a.send(ctx, prompt)
 	if err != nil {
 		return "", err
 	}
@@ -355,7 +364,7 @@ func (a *GeminiAgent) AuditSecurity(ctxData, imageScanData string) (string, erro
 	ctx, cancel := context.WithTimeout(context.Background(), aiTimeout)
 	defer cancel()
 	prompt := fmt.Sprintf("SECURITY AUDIT REQUEST.\nCONTEXT:\n%s\nIMAGE DATA:\n%s\nAnalyze security in Bahasa Melayu.", ctxData, imageScanData)
-	resp, err := a.session.SendMessage(ctx, genai.Text(prompt))
+	resp, err := a.send(ctx, prompt)
 	if err != nil {
 		return "", err
 	}
@@ -367,11 +376,23 @@ func (a *GeminiAgent) TriageIssue(containerName, triageType, data string) (strin
 	ctx, cancel := context.WithTimeout(context.Background(), aiTimeout)
 	defer cancel()
 	prompt := fmt.Sprintf("TRIAGE REQUEST: %s\nTarget: %s\nData:\n%s\nPerform triage in Bahasa Melayu.", triageType, containerName, data)
-	resp, err := a.session.SendMessage(ctx, genai.Text(prompt))
+	resp, err := a.send(ctx, prompt)
 	if err != nil {
 		return "", err
 	}
 	return a.extractText(resp), nil
+}
+
+// send is a small helper that wraps session.SendMessage with retry/backoff so
+// every diagnostic path automatically survives transient upstream errors.
+func (a *GeminiAgent) send(ctx context.Context, prompt string) (*genai.GenerateContentResponse, error) {
+	var resp *genai.GenerateContentResponse
+	err := withRetry(ctx, func() error {
+		r, e := a.session.SendMessage(ctx, genai.Text(prompt))
+		resp = r
+		return e
+	})
+	return resp, err
 }
 
 // extractText is a helper to get text from genai.Response

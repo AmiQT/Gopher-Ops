@@ -100,7 +100,8 @@ All runtime behaviour is driven through environment variables (loaded from `.env
 |---|---|---|
 | `GEMINI_API_KEY` | _(required)_ | Google Gemini API key. |
 | `TELEGRAM_BOT_TOKEN` | _(required)_ | Telegram bot token from @BotFather. |
-| `AUTHORIZED_CHAT_ID` | _(required)_ | Numeric Telegram chat ID allowed to talk to the bot. |
+| `AUTHORIZED_CHAT_IDS` | _(required)_ | Comma-separated Telegram chat IDs allowed to control the bot. Every operator receives every alert. |
+| `AUTHORIZED_CHAT_ID` | _(legacy)_ | Single-ID fallback honored when `AUTHORIZED_CHAT_IDS` is unset. |
 | `LLM_PROVIDER` | `gemini` | `gemini` or `local` (OpenAI-compatible endpoint). |
 | `LLM_BASE_URL` | _(empty)_ | Base URL for the local LLM endpoint (e.g. LM Studio, Ollama). |
 | `LLM_MODEL` | _(empty)_ | Model name when using a local LLM. |
@@ -112,8 +113,15 @@ All runtime behaviour is driven through environment variables (loaded from `.env
 | `METRICS_HISTORY_SIZE` | `60` | Rolling window of metric points retained in memory. |
 | `RCA_LOG_LINES` | `200` | Log lines passed to the AI for root-cause analysis. |
 | `AI_TIMEOUT_SECONDS` | `60` | Hard timeout on every Gemini / local-LLM round trip. |
+| `AI_RETRY_ATTEMPTS` | `3` | Total attempts per AI call before giving up. |
+| `AI_RETRY_BASE_DELAY_MS` | `1000` | Initial backoff between AI retries; doubles per attempt. |
 | `AI_DESTRUCTIVE_ALLOWED` | `false` | Set `true` to let the AI call `Stop`/`Restart` directly. Default forces HITL. |
+| `RATE_LIMIT_PER_MINUTE` | `30` | Max commands per minute per operator (token bucket). |
+| `TELEGRAM_QUEUE_SIZE` | `256` | Bounded backlog for the async broadcaster. |
+| `HEALTH_PORT` | _(empty)_ | Port for the `/health` JSON endpoint. Empty = disabled. |
 | `AUDIT_LOG_PATH` | `audit.log` | Path for the structured JSON-line audit log. |
+| `AUDIT_LOG_MAX_SIZE_MB` | `10` | Rotate audit log when it exceeds this many MB. |
+| `AUDIT_LOG_MAX_FILES` | `5` | Number of rotated audit files retained. |
 | `MONITOR_URLS` | _(empty)_ | Comma-separated URLs probed each minute for HTTP health. |
 
 ## 🧠 Deep Root-Cause Analysis
@@ -142,6 +150,17 @@ Gopher-Ops is engineered to run unattended in production. Highlights:
 - **Graceful shutdown** — `SIGINT` / `SIGTERM` cancel the update loop and stop the background monitor cleanly.
 - **Self-healing monitor** — the background goroutine is wrapped in panic recovery; if it crashes, it auto-restarts after 5 seconds without taking down the bot.
 
+## 🚢 Production Deployment
+
+Designed to be deployed and forgotten. Key production-grade properties:
+
+- **Multi-operator broadcast** — set `AUTHORIZED_CHAT_IDS=111,222,333` to fan every alert to your full on-call rotation. No single point of failure if one operator's phone is dead.
+- **Async Telegram queue** — alerts are enqueued and drained by a dedicated worker. The monitor loop never blocks on Telegram API latency, so a slow API cannot stall container-state polling.
+- **Per-operator rate limiting** — token-bucket caps commands at `RATE_LIMIT_PER_MINUTE` per chat (default 30). A compromised account cannot weaponize the AI to burn through your Gemini quota.
+- **AI retry with exponential backoff** — every Gemini / local-LLM call retries `AI_RETRY_ATTEMPTS` times (default 3) with `1s → 2s → 4s` backoff. Transient 503s or network blips no longer mean a missed diagnosis.
+- **HTTP `/health` endpoint** — set `HEALTH_PORT=8080` to expose `{"status":"ok","uptime_seconds":N}` for Kubernetes liveness probes, uptime monitors, or load balancers.
+- **Audit log rotation** — `audit.log` rotates at `AUDIT_LOG_MAX_SIZE_MB` (default 10 MB), keeping `AUDIT_LOG_MAX_FILES` historical copies (default 5). Disk cannot fill from forensic logging.
+
 ## 🎮 ChatOps Usage
 
 Once the bot is running, simply PM it on Telegram to start managing your infrastructure:
@@ -157,11 +176,14 @@ Once the bot is running, simply PM it on Telegram to start managing your infrast
 │   └── main.go           # Bot entry point, Telegram handler, graceful shutdown
 ├── pkg/
 │   ├── actions/          # Docker & Terraform execution logic
-│   ├── ai/               # Gemini & local-LLM agents, tool dispatch, safe mode
-│   ├── audit/            # Structured JSON-line audit log
+│   ├── ai/               # Gemini & local-LLM agents, tool dispatch, retry/backoff
+│   ├── audit/            # Structured JSON-line audit log (with rotation)
 │   ├── docker/           # Shared Docker client singleton (timeout-bounded calls)
+│   ├── health/           # HTTP /health endpoint for external probes
 │   ├── mcp/              # Model Context Protocol (Kubernetes) manager
-│   └── monitor/          # Metrics, container tracking, crash-context inspect
+│   ├── monitor/          # Metrics, container tracking, crash-context inspect
+│   ├── notify/           # Async multi-operator Telegram broadcaster
+│   └── ratelimit/        # Per-chat token-bucket throttling
 ├── terraform/            # IaC for the microservices lab
 ├── .github/workflows/    # CI/CD (Go tests & TF validation)
 ├── .env.example          # Template for required environment variables

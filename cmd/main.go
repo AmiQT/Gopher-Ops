@@ -17,7 +17,10 @@ import (
 	"gopher-ops/pkg/actions"
 	"gopher-ops/pkg/ai"
 	"gopher-ops/pkg/audit"
+	"gopher-ops/pkg/health"
 	"gopher-ops/pkg/monitor"
+	"gopher-ops/pkg/notify"
+	"gopher-ops/pkg/ratelimit"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
@@ -65,6 +68,19 @@ func main() {
 	if p := os.Getenv("AUDIT_LOG_PATH"); p != "" {
 		audit.SetPath(p)
 	}
+	var auditMaxBytes int64 = 10 * 1024 * 1024
+	if v := os.Getenv("AUDIT_LOG_MAX_SIZE_MB"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			auditMaxBytes = n * 1024 * 1024
+		}
+	}
+	auditMaxFiles := 5
+	if v := os.Getenv("AUDIT_LOG_MAX_FILES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			auditMaxFiles = n
+		}
+	}
+	audit.SetRotation(auditMaxBytes, auditMaxFiles)
 	audit.Log(audit.Event{Type: "boot", Actor: "system", Status: "ok"})
 
 	apiKey := os.Getenv("GEMINI_API_KEY")
@@ -79,16 +95,16 @@ func main() {
 		os.Exit(1)
 	}
 
-	authIDStr := os.Getenv("AUTHORIZED_CHAT_ID")
-	if authIDStr == "" {
-		slog.Error("AUTHORIZED_CHAT_ID is not set — required for production safety")
-		os.Exit(1)
-	}
-	authorizedChatID, err := strconv.ParseInt(authIDStr, 10, 64)
+	authorizedIDs, authorizedSet, err := parseAuthorizedChatIDs()
 	if err != nil {
-		slog.Error("AUTHORIZED_CHAT_ID must be a valid number", "error", err)
+		slog.Error("Authorized chat IDs invalid", "error", err)
 		os.Exit(1)
 	}
+	if len(authorizedIDs) == 0 {
+		slog.Error("AUTHORIZED_CHAT_IDS (or AUTHORIZED_CHAT_ID) is not set — required for production safety")
+		os.Exit(1)
+	}
+	slog.Info("Authorized operators configured", "count", len(authorizedIDs))
 
 	// Configurable thresholds
 	cpuThreshold := 80.0
@@ -117,6 +133,14 @@ func main() {
 			alertCooldown = time.Duration(n) * time.Minute
 		}
 	}
+
+	rateLimit := 30.0
+	if v := os.Getenv("RATE_LIMIT_PER_MINUTE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			rateLimit = f
+		}
+	}
+	limiter := ratelimit.New(rateLimit)
 
 	// 1. Initialize AI Agent
 	llmProvider := os.Getenv("LLM_PROVIDER")
@@ -159,7 +183,22 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// 4. Start Background Monitor with panic recovery and auto-restart
+	// 4. Optional /health HTTP endpoint
+	if port := os.Getenv("HEALTH_PORT"); port != "" {
+		health.New(port).Start(ctx)
+	}
+
+	// 5. Async Telegram broadcaster (fan-out to all authorized operators)
+	queueSize := 256
+	if v := os.Getenv("TELEGRAM_QUEUE_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			queueSize = n
+		}
+	}
+	broadcaster := notify.NewQueue(bot, authorizedIDs, queueSize)
+	go broadcaster.Run(ctx)
+
+	// 6. Start Background Monitor with panic recovery and auto-restart
 	go func() {
 		for {
 			func() {
@@ -168,7 +207,7 @@ func main() {
 						slog.Error("🔥 Background monitor panicked — restarting", "panic", r)
 					}
 				}()
-				startBackgroundMonitor(ctx, bot, agent, authorizedChatID, cpuThreshold, cpuDuration, alertCooldown)
+				startBackgroundMonitor(ctx, broadcaster, agent, cpuThreshold, cpuDuration, alertCooldown)
 			}()
 
 			select {
@@ -197,8 +236,14 @@ func main() {
 				return
 			}
 			if update.CallbackQuery != nil {
-				if update.CallbackQuery.Message.Chat.ID != authorizedChatID {
+				chatID := update.CallbackQuery.Message.Chat.ID
+				if !authorizedSet[chatID] {
 					callbackConfig := tgbotapi.NewCallback(update.CallbackQuery.ID, "❌ Kau siapa siot?")
+					bot.Request(callbackConfig)
+					continue
+				}
+				if !limiter.Allow(chatID) {
+					callbackConfig := tgbotapi.NewCallback(update.CallbackQuery.ID, "⏳ Slow down — rate limited.")
 					bot.Request(callbackConfig)
 					continue
 				}
@@ -210,8 +255,19 @@ func main() {
 				continue
 			}
 
-			if update.Message.Chat.ID != authorizedChatID {
-				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "❌ Warganegara asing dilarang masuk. Kau sapa takde access level nak borak dengan aku bro. GG.")
+			chatID := update.Message.Chat.ID
+			if !authorizedSet[chatID] {
+				msg := tgbotapi.NewMessage(chatID, "❌ Warganegara asing dilarang masuk. Kau sapa takde access level nak borak dengan aku bro. GG.")
+				bot.Send(msg)
+				audit.Log(audit.Event{
+					Type: "alert", Actor: "system", Action: "unauthorized_access",
+					Target: strconv.FormatInt(chatID, 10), Status: "info",
+				})
+				continue
+			}
+
+			if !limiter.Allow(chatID) {
+				msg := tgbotapi.NewMessage(chatID, "⏳ Whoa, slow down bro! Limit kau dah cecah. Try semula dalam seminit.")
 				bot.Send(msg)
 				continue
 			}
@@ -492,8 +548,11 @@ func buildRCAEvidence(containerID string) string {
 	return sb.String()
 }
 
-// startBackgroundMonitor checks system health every minute and alerts the user.
-func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64, cpuThreshold float64, cpuDuration int, alertCooldown time.Duration) {
+// startBackgroundMonitor checks system health every minute and broadcasts
+// alerts to every authorized operator via the async notify queue. The
+// broadcaster decouples this loop from Telegram API latency, so a slow API
+// cannot stall container-state polling.
+func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agent ai.AIAgent, cpuThreshold float64, cpuDuration int, alertCooldown time.Duration) {
 	slog.Info("🩺 Background monitor started",
 		"cpu_threshold", cpuThreshold,
 		"cpu_duration_min", cpuDuration,
@@ -630,9 +689,7 @@ func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.
 
 					msgText := fmt.Sprintf("🤖 **AUTOPILOT ACTION! (Attempt %d/3)**\n\nContainer **%s** tadi DOWN. Aku dah tolong restartkan untuk kau!\n\n**Analisis AI:**\n%s",
 						restartTracker[id], safeName, analysis)
-					msg := tgbotapi.NewMessage(chatID, msgText)
-					msg.ParseMode = "Markdown"
-					bot.Send(msg)
+					broadcaster.Broadcast(notify.Broadcast{Text: msgText, ParseMode: "Markdown"})
 					alertState[id] = "autopilot_sent"
 					alertSentAt[id] = time.Now()
 					saveState()
@@ -650,12 +707,15 @@ func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.
 						Target: id, Status: "info", Detail: current.Name,
 					})
 
-					msg := tgbotapi.NewMessage(chatID, alertMsg)
-					msg.ParseMode = "Markdown"
 					btnRestart := tgbotapi.NewInlineKeyboardButtonData("🔄 Restart Now", "RestartContainer:"+id)
 					btnRCA := tgbotapi.NewInlineKeyboardButtonData("🔍 Siasat Punca (RCA)", "AnalyzeRCA:"+id)
-					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnRestart), tgbotapi.NewInlineKeyboardRow(btnRCA))
-					bot.Send(msg)
+					keyboard := tgbotapi.NewInlineKeyboardMarkup(
+						tgbotapi.NewInlineKeyboardRow(btnRestart),
+						tgbotapi.NewInlineKeyboardRow(btnRCA),
+					)
+					broadcaster.Broadcast(notify.Broadcast{
+						Text: alertMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard,
+					})
 					saveState()
 				}
 			}
@@ -677,9 +737,7 @@ func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.
 				status := monitor.CheckHTTP(u)
 				if !status.IsUp {
 					alertMsg := fmt.Sprintf("🌐 **HTTP ALERT!** Website [%s](%s) return error!\nStatus Code: **%d**\nCheck jap bro, kot-kot app hang.", u, u, status.StatusCode)
-					msg := tgbotapi.NewMessage(chatID, alertMsg)
-					msg.ParseMode = "Markdown"
-					bot.Send(msg)
+					broadcaster.Broadcast(notify.Broadcast{Text: alertMsg, ParseMode: "Markdown"})
 				}
 			}
 		}
@@ -687,11 +745,11 @@ func startBackgroundMonitor(ctx context.Context, bot *tgbotapi.BotAPI, agent ai.
 		// Sustained CPU load alert
 		if monitor.GlobalMetricStore.CheckSustainedLoad(cpuThreshold, cpuDuration) {
 			alertMsg := fmt.Sprintf("🔥 **SUSTAINED HIGH LOAD ALERT!**\n\nCPU load kau dah lebih **%.0f%%** untuk %d minit berturut-turut bro! Server tengah berpeluh tu. 🥵\n\nNak aku check container mana yang makan resource paling banyak?", cpuThreshold, cpuDuration)
-			msg := tgbotapi.NewMessage(chatID, alertMsg)
-			msg.ParseMode = "Markdown"
 			btnCheck := tgbotapi.NewInlineKeyboardButtonData("📊 Check Resource Hogs", "VisualMetrics:all")
-			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnCheck))
-			bot.Send(msg)
+			keyboard := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnCheck))
+			broadcaster.Broadcast(notify.Broadcast{
+				Text: alertMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard,
+			})
 		}
 
 		previousStates = currentStates
@@ -711,4 +769,35 @@ func shouldAlert(status string, lastSent time.Time, cooldown time.Duration) bool
 		return true
 	}
 	return time.Since(lastSent) > cooldown
+}
+
+// parseAuthorizedChatIDs accepts a comma-separated AUTHORIZED_CHAT_IDS env
+// (preferred), or a single AUTHORIZED_CHAT_ID for backwards compatibility,
+// and returns the list plus a set for O(1) lookup.
+func parseAuthorizedChatIDs() ([]int64, map[int64]bool, error) {
+	raw := os.Getenv("AUTHORIZED_CHAT_IDS")
+	if raw == "" {
+		raw = os.Getenv("AUTHORIZED_CHAT_ID")
+	}
+	if raw == "" {
+		return nil, nil, nil
+	}
+
+	var ids []int64
+	set := make(map[int64]bool)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid chat ID %q: %w", part, err)
+		}
+		if !set[id] {
+			set[id] = true
+			ids = append(ids, id)
+		}
+	}
+	return ids, set, nil
 }

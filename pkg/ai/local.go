@@ -57,15 +57,16 @@ func (a *LocalAgent) ProcessRequest(userMsg string) (string, []ActionIntent, err
 		Content: enrichedPrompt,
 	})
 
-	// 2. Query Model
-	resp, err := a.client.CreateChatCompletion(
-		ctx,
-		openai.ChatCompletionRequest{
+	// 2. Query Model with retry
+	var resp openai.ChatCompletionResponse
+	err = withRetry(ctx, func() error {
+		r, e := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
 			Model:    a.model,
 			Messages: a.history,
-		},
-	)
-
+		})
+		resp = r
+		return e
+	})
 	if err != nil {
 		return "", nil, fmt.Errorf("local LLM error: %v", err)
 	}
@@ -127,12 +128,17 @@ Reply in Bahasa Melayu using:
 - **Evidence:**
 - **Recommended Action:**`, containerName, evidence)
 
-	resp, err := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: a.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: a.sysPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: prompt},
-		},
+	var resp openai.ChatCompletionResponse
+	err := withRetry(ctx, func() error {
+		r, e := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+			Model: a.model,
+			Messages: []openai.ChatCompletionMessage{
+				{Role: openai.ChatMessageRoleSystem, Content: a.sysPrompt},
+				{Role: openai.ChatMessageRoleUser, Content: prompt},
+			},
+		})
+		resp = r
+		return e
 	})
 	if err != nil {
 		return "", err
@@ -146,12 +152,17 @@ func (a *LocalAgent) AuditSecurity(ctxData, imageScanData string) (string, error
 	defer cancel()
 	prompt := fmt.Sprintf("SECURITY AUDIT REQUEST.\nCONTAINER DATA:\n%s\nIMAGE VULN DATA:\n%s\n\nPlease provide security score and hardening steps in Bahasa Melayu.", ctxData, imageScanData)
 
-	resp, err := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: a.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: a.sysPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: prompt},
-		},
+	var resp openai.ChatCompletionResponse
+	err := withRetry(ctx, func() error {
+		r, e := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+			Model: a.model,
+			Messages: []openai.ChatCompletionMessage{
+				{Role: openai.ChatMessageRoleSystem, Content: a.sysPrompt},
+				{Role: openai.ChatMessageRoleUser, Content: prompt},
+			},
+		})
+		resp = r
+		return e
 	})
 	if err != nil {
 		return "", err
@@ -165,12 +176,17 @@ func (a *LocalAgent) TriageIssue(containerName, triageType, data string) (string
 	defer cancel()
 	prompt := fmt.Sprintf("SRE TRIAGE REQUEST.\nTarget: %s\nType: %s\nData:\n%s\n\nPlease provide investigation findings in Bahasa Melayu.", containerName, triageType, data)
 
-	resp, err := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
-		Model: a.model,
-		Messages: []openai.ChatCompletionMessage{
-			{Role: openai.ChatMessageRoleSystem, Content: a.sysPrompt},
-			{Role: openai.ChatMessageRoleUser, Content: prompt},
-		},
+	var resp openai.ChatCompletionResponse
+	err := withRetry(ctx, func() error {
+		r, e := a.client.CreateChatCompletion(ctx, openai.ChatCompletionRequest{
+			Model: a.model,
+			Messages: []openai.ChatCompletionMessage{
+				{Role: openai.ChatMessageRoleSystem, Content: a.sysPrompt},
+				{Role: openai.ChatMessageRoleUser, Content: prompt},
+			},
+		})
+		resp = r
+		return e
 	})
 	if err != nil {
 		return "", err

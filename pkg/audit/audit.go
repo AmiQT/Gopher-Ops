@@ -6,6 +6,7 @@ package audit
 
 import (
 	"encoding/json"
+	"fmt"
 	"log/slog"
 	"os"
 	"sync"
@@ -24,8 +25,10 @@ type Event struct {
 }
 
 var (
-	mu   sync.Mutex
-	path = "audit.log"
+	mu       sync.Mutex
+	path     = "audit.log"
+	maxSize  int64 = 10 * 1024 * 1024 // 10 MB before rotation
+	maxFiles       = 5                // keep audit.log + audit.log.1..audit.log.5
 )
 
 // SetPath overrides the audit log destination. Call before the first Log().
@@ -34,6 +37,45 @@ func SetPath(p string) {
 	defer mu.Unlock()
 	if p != "" {
 		path = p
+	}
+}
+
+// SetRotation configures size-based rotation. `bytes` is the threshold above
+// which the active file is renamed to .1 and a fresh file is started.
+// `files` is the number of historical files to retain.
+func SetRotation(bytes int64, files int) {
+	mu.Lock()
+	defer mu.Unlock()
+	if bytes > 0 {
+		maxSize = bytes
+	}
+	if files > 0 {
+		maxFiles = files
+	}
+}
+
+// rotateIfNeeded must be called with mu held. It shifts audit.log.N-1 →
+// audit.log.N for each kept generation, drops the oldest, and renames the
+// current file to .1.
+func rotateIfNeeded() {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() < maxSize {
+		return
+	}
+
+	// Drop the oldest generation.
+	_ = os.Remove(fmt.Sprintf("%s.%d", path, maxFiles))
+
+	// Shift the rest: .N-1 → .N, ..., .1 → .2
+	for i := maxFiles - 1; i >= 1; i-- {
+		oldName := fmt.Sprintf("%s.%d", path, i)
+		newName := fmt.Sprintf("%s.%d", path, i+1)
+		_ = os.Rename(oldName, newName)
+	}
+
+	// Active file becomes .1
+	if err := os.Rename(path, path+".1"); err != nil {
+		slog.Warn("audit rotate failed", "error", err)
 	}
 }
 
@@ -52,6 +94,8 @@ func Log(evt Event) {
 		slog.Warn("audit marshal failed", "error", err)
 		return
 	}
+
+	rotateIfNeeded()
 
 	f, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
 	if err != nil {
