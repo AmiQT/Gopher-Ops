@@ -4,11 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
-	
+
+	"gopher-ops/pkg/actions"
 	"gopher-ops/pkg/mcp"
 	"gopher-ops/pkg/monitor"
 )
@@ -67,7 +68,7 @@ func NewGeminiAgent(apiKey, modelType string) (*GeminiAgent, error) {
 	// 1. Initialize MCP Manager
 	mcpMgr, err := mcp.NewMCPManager()
 	if err != nil {
-		log.Printf("⚠️ MCP Warning: Failed to start K8s MCP server: %v. Running in local-only mode.", err)
+		slog.Warn("MCP server unavailable — running in local-only mode", "error", err)
 	}
 
 	// 2. Register Tools
@@ -185,23 +186,12 @@ func (a *GeminiAgent) ProcessRequest(userMsg string) (string, []ActionIntent, er
 		// Execute Tool Calls
 		var toolResults []genai.Part
 		for _, call := range toolCalls {
-			log.Printf("🛠️ AI Calling Tool: %s with args: %v", call.Name, call.Args)
-			
-			var result string
-			var execErr error
+			slog.Info("🛠️ AI calling tool", "name", call.Name, "args", call.Args)
 
-			// Check if it's an MCP tool or Local tool
-			// (This is a simplified dispatch logic)
-			if a.mcpManager != nil {
-				// Try calling via MCP first if it exists there
-				result, execErr = a.mcpManager.CallTool(ctx, call.Name, call.Args)
-			}
-			
-			// Fallback or Handle Local Actions if not found in MCP
-			if execErr != nil || result == "" {
-				// Here we would call our local Go functions from actions package
-				// result = actions.Dispatch(call.Name, call.Args)
-				result = fmt.Sprintf("Executed %s successfully (local mock).", call.Name)
+			result, execErr := a.dispatchTool(ctx, call.Name, call.Args)
+			if execErr != nil {
+				slog.Warn("Tool execution failed", "name", call.Name, "error", execErr)
+				result = fmt.Sprintf("Tool %s failed: %v", call.Name, execErr)
 			}
 
 			toolResults = append(toolResults, genai.FunctionResponse{
@@ -227,7 +217,40 @@ func (a *GeminiAgent) ProcessRequest(userMsg string) (string, []ActionIntent, er
 		}
 	}
 
+	// 5. Extract HITL intents from text so the UI can render confirmation buttons
+	intents = ExtractIntents(output)
+
 	return output, intents, nil
+}
+
+// dispatchTool routes a Gemini function call to the correct backend.
+// Local Docker operations run through the actions package; everything else
+// falls through to the MCP manager (Kubernetes tools).
+func (a *GeminiAgent) dispatchTool(ctx context.Context, name string, args map[string]any) (string, error) {
+	containerID, _ := args["containerID"].(string)
+
+	switch name {
+	case "RestartContainer":
+		if containerID == "" {
+			return "", fmt.Errorf("missing containerID")
+		}
+		return actions.RestartContainer(containerID)
+	case "StopContainer":
+		if containerID == "" {
+			return "", fmt.Errorf("missing containerID")
+		}
+		return actions.StopContainer(containerID)
+	case "GetContainerLogs":
+		if containerID == "" {
+			return "", fmt.Errorf("missing containerID")
+		}
+		return actions.GetContainerLogs(containerID)
+	default:
+		if a.mcpManager != nil {
+			return a.mcpManager.CallTool(ctx, name, args)
+		}
+		return "", fmt.Errorf("unknown tool: %s", name)
+	}
 }
 
 // ResetSession clears the conversation history to save tokens

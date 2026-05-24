@@ -92,6 +92,35 @@ cd ..
 go run cmd/main.go
 ```
 
+## ⚙️ Configuration
+
+All runtime behaviour is driven through environment variables (loaded from `.env`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GEMINI_API_KEY` | _(required)_ | Google Gemini API key. |
+| `TELEGRAM_BOT_TOKEN` | _(required)_ | Telegram bot token from @BotFather. |
+| `AUTHORIZED_CHAT_ID` | _(required)_ | Numeric Telegram chat ID allowed to talk to the bot. |
+| `LLM_PROVIDER` | `gemini` | `gemini` or `local` (OpenAI-compatible endpoint). |
+| `LLM_BASE_URL` | _(empty)_ | Base URL for the local LLM endpoint (e.g. LM Studio, Ollama). |
+| `LLM_MODEL` | _(empty)_ | Model name when using a local LLM. |
+| `LOCAL_LLM_API_KEY` | `lm-studio` | API key for the local LLM endpoint. |
+| `AUTOPILOT_ENABLED` | `false` | When `true`, auto-restart failed containers (max 3 attempts before HITL handoff). |
+| `ALERT_CPU_THRESHOLD` | `80.0` | Sustained CPU percentage that triggers an alert. |
+| `ALERT_CPU_DURATION` | `5` | Minutes of sustained high CPU before alerting. |
+| `METRICS_HISTORY_SIZE` | `60` | Rolling window of metric points retained in memory. |
+| `MONITOR_URLS` | _(empty)_ | Comma-separated URLs probed each minute for HTTP health. |
+
+## 🛡️ Reliability & Observability
+
+Gopher-Ops is engineered to run unattended. Highlights:
+
+- **Shared Docker client** — one socket connection is reused across all packages, eliminating per-call connection churn.
+- **Bounded Docker calls** — every Docker API request runs under a 30-second `context.WithTimeout`, so a stalled daemon cannot freeze the bot.
+- **Structured logging** — Go's `log/slog` emits key-value fields (container ID, action, error) suitable for log aggregators.
+- **Graceful shutdown** — `SIGINT` / `SIGTERM` cancel the update loop and stop the background monitor cleanly.
+- **Self-healing monitor** — the background goroutine is wrapped in panic recovery; if it crashes, it auto-restarts after 5 seconds without taking down the bot.
+
 ## 🎮 ChatOps Usage
 
 Once the bot is running, simply PM it on Telegram to start managing your infrastructure:
@@ -104,14 +133,16 @@ Once the bot is running, simply PM it on Telegram to start managing your infrast
 ```text
 .
 ├── cmd/
-│   └── main.go           # Bot entry point & Telegram handler
+│   └── main.go           # Bot entry point, Telegram handler, graceful shutdown
 ├── pkg/
 │   ├── actions/          # Docker & Terraform execution logic
-│   ├── ai/               # Gemini AI integration & prompt engineering
-│   ├── mcp/              # Model Context Protocol (K8s) manager
-│   └── monitor/          # System metrics & container tracking
+│   ├── ai/               # Gemini & local-LLM agents, tool dispatch, intent parsing
+│   ├── docker/           # Shared Docker client singleton (timeout-bounded calls)
+│   ├── mcp/              # Model Context Protocol (Kubernetes) manager
+│   └── monitor/          # System metrics, container tracking, rolling history
 ├── terraform/            # IaC for the microservices lab
 ├── .github/workflows/    # CI/CD (Go tests & TF validation)
+├── .env.example          # Template for required environment variables
 ├── demo-k8s.yaml         # Sample K8s manifest
 └── README.md             # You are here!
 ```
