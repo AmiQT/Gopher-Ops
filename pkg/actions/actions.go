@@ -1,27 +1,31 @@
 package actions
 
 import (
+	"bytes"
 	"context"
 	"fmt"
+	"io"
+	"time"
+
+	"gopher-ops/pkg/docker"
 
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
-	"io"
-	"bytes"
 )
 
+const dockerTimeout = 30 * time.Second
+
 // RestartContainer allows the AI to trigger a container restart.
-// We are mimicking a self-healing action here.
 func RestartContainer(containerID string) (string, error) {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := docker.Get()
 	if err != nil {
-		return "", fmt.Errorf("failed to init docker client: %v", err)
+		return "", fmt.Errorf("failed to get docker client: %w", err)
 	}
-	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
 
 	if err := cli.ContainerRestart(ctx, containerID, container.StopOptions{}); err != nil {
-		return "", fmt.Errorf("failed to restart %s: %v", containerID, err)
+		return "", fmt.Errorf("failed to restart %s: %w", containerID, err)
 	}
 
 	return fmt.Sprintf("Successfully triggered restart on container %s", containerID), nil
@@ -29,30 +33,33 @@ func RestartContainer(containerID string) (string, error) {
 
 // StartContainer allows the AI to start a stopped container.
 func StartContainer(containerID string) (string, error) {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := docker.Get()
 	if err != nil {
-		return "", fmt.Errorf("failed to init docker client: %v", err)
+		return "", fmt.Errorf("failed to get docker client: %w", err)
 	}
-	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
 
 	if err := cli.ContainerStart(ctx, containerID, container.StartOptions{}); err != nil {
-		return "", fmt.Errorf("failed to start %s: %v", containerID, err)
+		return "", fmt.Errorf("failed to start %s: %w", containerID, err)
 	}
 
 	return fmt.Sprintf("Successfully started container %s", containerID), nil
 }
-func StopContainer(containerID string) (string, error) {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
-	if err != nil {
-		return "", fmt.Errorf("failed to init docker client: %v", err)
-	}
-	defer cli.Close()
 
-	// Stop container
+// StopContainer allows the AI to stop a running container.
+func StopContainer(containerID string) (string, error) {
+	cli, err := docker.Get()
+	if err != nil {
+		return "", fmt.Errorf("failed to get docker client: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+
 	if err := cli.ContainerStop(ctx, containerID, container.StopOptions{}); err != nil {
-		return "", fmt.Errorf("failed to stop %s: %v", containerID, err)
+		return "", fmt.Errorf("failed to stop %s: %w", containerID, err)
 	}
 
 	return fmt.Sprintf("Successfully stopped container %s", containerID), nil
@@ -60,18 +67,18 @@ func StopContainer(containerID string) (string, error) {
 
 // ClearCache simulates a cleanup or cache clearing operation.
 func ClearCache() string {
-	// Normally this could run `redis-cli flushall` or similar inside an exec command.
 	return "System cache cleared successfully. Memory impact should decrease."
 }
 
-// GetContainerLogs fetches the last 10 lines of logs for a container
+// GetContainerLogs fetches the last 10 lines of logs for a container.
 func GetContainerLogs(containerID string) (string, error) {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := docker.Get()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to get docker client: %w", err)
 	}
-	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
 
 	options := container.LogsOptions{
 		ShowStdout: true,
@@ -81,28 +88,24 @@ func GetContainerLogs(containerID string) (string, error) {
 
 	out, err := cli.ContainerLogs(ctx, containerID, options)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to get logs for %s: %w", containerID, err)
 	}
 	defer out.Close()
 
 	buf := new(bytes.Buffer)
-	_, err = io.Copy(buf, out)
-	if err != nil {
-		return "", err
+	if _, err = io.Copy(buf, out); err != nil {
+		return "", fmt.Errorf("failed to read logs for %s: %w", containerID, err)
 	}
 
 	return buf.String(), nil
 }
 
-// InvestigateNetwork simulates checking connectivity for a container
+// InvestigateNetwork simulates checking connectivity for a container.
 func InvestigateNetwork(containerID string) string {
-	// Mock: Check if container can reach google.com or similar
 	return "NETWORK ANALYSIS: Container can reach external network. No obvious DNS or Routing issues found."
 }
 
-// CheckConfig simulates a configuration validation check
+// CheckConfig simulates a configuration validation check.
 func CheckConfig(containerID string) string {
-	// Mock: Check common config files
 	return "CONFIG ANALYSIS: Found /etc/nginx/nginx.conf. Syntax is OK. No conflicting upstream rules detected."
 }
-

@@ -5,53 +5,61 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
+	"gopher-ops/pkg/docker"
+
 	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/mem"
-	"sync"
 )
 
-// MetricPoint stores a single snapshot of system load
+const dockerTimeout = 30 * time.Second
+
+// MetricPoint stores a single snapshot of system load.
 type MetricPoint struct {
 	Timestamp time.Time
 	CPU       float64
 	RAM       float64
 }
 
-// MetricStore holds the last 60 minutes of metrics
+// MetricStore holds a rolling window of system metrics.
 type MetricStore struct {
 	mu      sync.RWMutex
 	Points  []MetricPoint
 	MaxSize int
 }
 
-// GlobalMetricStore is the in-memory database for metrics
+// GlobalMetricStore is the in-memory database for metrics.
 var GlobalMetricStore = &MetricStore{
 	Points:  make([]MetricPoint, 0),
-	MaxSize: 60, // 60 minutes
+	MaxSize: 60,
 }
 
-// PushMetrics adds a new point and prunes old ones
+// SetMetricsHistorySize updates the rolling window size.
+func SetMetricsHistorySize(n int) {
+	GlobalMetricStore.mu.Lock()
+	defer GlobalMetricStore.mu.Unlock()
+	GlobalMetricStore.MaxSize = n
+}
+
+// PushMetrics adds a new data point and prunes old ones.
 func (s *MetricStore) PushMetrics(cpuLoad, ramLoad float64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	newPoint := MetricPoint{
+	s.Points = append(s.Points, MetricPoint{
 		Timestamp: time.Now(),
 		CPU:       cpuLoad,
 		RAM:       ramLoad,
-	}
-
-	s.Points = append(s.Points, newPoint)
+	})
 	if len(s.Points) > s.MaxSize {
 		s.Points = s.Points[1:]
 	}
 }
 
-// CheckSustainedLoad returns true if the average load over the last X points exceeds threshold
+// CheckSustainedLoad returns true if the average CPU over the last N points exceeds threshold.
 func (s *MetricStore) CheckSustainedLoad(threshold float64, count int) bool {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -60,19 +68,15 @@ func (s *MetricStore) CheckSustainedLoad(threshold float64, count int) bool {
 		return false
 	}
 
-	// Look at the last 'count' points
 	subset := s.Points[len(s.Points)-count:]
 	var sum float64
 	for _, p := range subset {
 		sum += p.CPU
 	}
-
-	avg := sum / float64(len(subset))
-	return avg > threshold
+	return (sum / float64(len(subset))) > threshold
 }
 
-
-// Info is a struct that holds basic system status
+// Info holds basic container status.
 type Info struct {
 	ID    string
 	Names []string
@@ -80,31 +84,32 @@ type Info struct {
 	Image string
 }
 
-// ContainerStatus is used for tracking state changes
+// ContainerStatus is used for tracking state changes.
 type ContainerStatus struct {
 	Name  string
 	State string
 }
 
-// URLStatus tracks web endpoint health
+// URLStatus tracks web endpoint health.
 type URLStatus struct {
 	URL        string
 	StatusCode int
 	IsUp       bool
 }
 
-// GetSystemHealth gets an overview of containers running
+// GetSystemHealth returns an overview of containers and system metrics.
 func GetSystemHealth() (string, error) {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := docker.Get()
 	if err != nil {
-		return "", fmt.Errorf("failed to init docker client: %v", err)
+		return "", fmt.Errorf("failed to get docker client: %w", err)
 	}
-	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		return "", fmt.Errorf("failed to list containers: %v", err)
+		return "", fmt.Errorf("failed to list containers: %w", err)
 	}
 
 	var pb strings.Builder
@@ -115,17 +120,14 @@ func GetSystemHealth() (string, error) {
 		name := strings.Join(c.Names, ",")
 		pb.WriteString(fmt.Sprintf("[%s] %s | State: %s | Status: %s\n", c.ID[:8], name, c.State, c.Status))
 	}
-	
-	// Use REAL System Metrics instead of mock data
+
 	pb.WriteString("\n--- REAL LATEST SYSTEM METRICS ---\n")
-	
-	// Get real CPU (1 second interval for accurate live reading)
+
 	cpuPercents, _ := cpu.Percent(time.Second, false)
 	if len(cpuPercents) > 0 {
 		pb.WriteString(fmt.Sprintf("CPU Load: %.2f%%\n", cpuPercents[0]))
 	}
 
-	// Get real RAM
 	vMem, _ := mem.VirtualMemory()
 	ramPercent := 0.0
 	if vMem != nil {
@@ -136,24 +138,23 @@ func GetSystemHealth() (string, error) {
 	}
 	pb.WriteString("----------------------------\n")
 
-	// RECORD METRICS to the store
 	if len(cpuPercents) > 0 {
 		GlobalMetricStore.PushMetrics(cpuPercents[0], ramPercent)
 	}
 
-
 	return pb.String(), nil
 }
 
-// GetContainerName fetches the human-readable name of a container given its ID.
-// It returns just the ID if it can't find it.
+// GetContainerName fetches the human-readable name for a container ID.
+// Returns the ID itself if the name cannot be resolved.
 func GetContainerName(id string) string {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := docker.Get()
 	if err != nil {
 		return id
 	}
-	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
@@ -161,10 +162,8 @@ func GetContainerName(id string) string {
 	}
 
 	for _, c := range containers {
-		// Sometimes ID is shortened to 8-12 chars in the prompt, so use HasPrefix
 		if strings.HasPrefix(c.ID, id) {
 			if len(c.Names) > 0 {
-				// c.Names usually look like "/test-redis"
 				return c.Names[0]
 			}
 		}
@@ -172,18 +171,19 @@ func GetContainerName(id string) string {
 	return id
 }
 
-// GetContainerStates returns a map of container ID to its Name and State
+// GetContainerStates returns a map of container ID to its Name and State.
 func GetContainerStates() (map[string]ContainerStatus, error) {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := docker.Get()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get docker client: %w", err)
 	}
-	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to list containers: %w", err)
 	}
 
 	states := make(map[string]ContainerStatus)
@@ -200,11 +200,9 @@ func GetContainerStates() (map[string]ContainerStatus, error) {
 	return states, nil
 }
 
-// CheckHTTP probes a URL and returns status
+// CheckHTTP probes a URL and returns its status.
 func CheckHTTP(url string) URLStatus {
-	client := http.Client{
-		Timeout: 5 * time.Second,
-	}
+	client := http.Client{Timeout: 5 * time.Second}
 
 	resp, err := client.Get(url)
 	if err != nil {
@@ -216,18 +214,19 @@ func CheckHTTP(url string) URLStatus {
 	return URLStatus{URL: url, StatusCode: resp.StatusCode, IsUp: isUp}
 }
 
-// GetSecurityContext gathers security-related information for all containers
+// GetSecurityContext gathers security-related information for all containers.
 func GetSecurityContext() (string, error) {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := docker.Get()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to get docker client: %w", err)
 	}
-	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to list containers: %w", err)
 	}
 
 	var sb strings.Builder
@@ -235,32 +234,33 @@ func GetSecurityContext() (string, error) {
 	for _, c := range containers {
 		inspect, _ := cli.ContainerInspect(ctx, c.ID)
 		name := strings.TrimPrefix(c.Names[0], "/")
-		
+
 		isPrivileged := inspect.HostConfig.Privileged
 		user := inspect.Config.User
 		if user == "" {
 			user = "root (default)"
 		}
 
-		sb.WriteString(fmt.Sprintf("- Container: %s\n  Image: %s\n  User: %s\n  Privileged: %v\n  Ports: %v\n", 
+		sb.WriteString(fmt.Sprintf("- Container: %s\n  Image: %s\n  User: %s\n  Privileged: %v\n  Ports: %v\n",
 			name, c.Image, user, isPrivileged, c.Ports))
 	}
 
 	return sb.String(), nil
 }
 
-// GetVisualMetrics returns an ASCII bar chart of container resources
+// GetVisualMetrics returns an ASCII bar chart of container states.
 func GetVisualMetrics() (string, error) {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := docker.Get()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to get docker client: %w", err)
 	}
-	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to list containers: %w", err)
 	}
 
 	var sb strings.Builder
@@ -271,16 +271,13 @@ func GetVisualMetrics() (string, error) {
 		if len(name) > 15 {
 			name = name[:12] + "..."
 		}
-		
-		// For demo purposes, we'll simulate load or get real stats if possible.
-		// Docker Stats is complex to stream, so let's use a simplified visualization.
+
 		stateEmoji := "🟢"
 		if c.State != "running" {
 			stateEmoji = "🔴"
 		}
 
 		sb.WriteString(fmt.Sprintf("%s **%-15s**\n", stateEmoji, name))
-		// Simple bar for visual impact
 		if c.State == "running" {
 			sb.WriteString("`[||||||||||          ] 50%` (Estimated)\n")
 		} else {
@@ -291,29 +288,29 @@ func GetVisualMetrics() (string, error) {
 	return sb.String(), nil
 }
 
-// GetImageSecurityReport scans images and warns about outdated ones (Simulated)
+// GetImageSecurityReport scans images and warns about known vulnerable versions.
 func GetImageSecurityReport() (string, error) {
-	ctx := context.Background()
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := docker.Get()
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to get docker client: %w", err)
 	}
-	defer cli.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
 
 	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("failed to list containers: %w", err)
+	}
+
+	vulnerableImages := map[string]string{
+		"nginx:1.18":  "CRITICAL: CVE-2021-23017 (Off-by-one in resolver). Upgrade to 1.21+",
+		"redis:5.0":   "HIGH: CVE-2022-24736 (Lua script vulnerability). Upgrade to 6.0+",
+		"postgres:10": "MEDIUM: Out of support. Upgrade to 13+",
 	}
 
 	var sb strings.Builder
 	sb.WriteString("VULNERABILITY SCAN REPORT:\n")
-	
-	// Mock Vulnerability Database
-	vulnerableImages := map[string]string{
-		"nginx:1.18":    "CRITICAL: CVE-2021-23017 (Off-by-one in resolver). Upgrade to 1.21+",
-		"redis:5.0":     "HIGH: CVE-2022-24736 (Lua script vulnerability). Upgrade to 6.0+",
-		"postgres:10":   "MEDIUM: Out of support. Upgrade to 13+",
-	}
 
 	foundCount := 0
 	for _, c := range containers {
@@ -332,4 +329,3 @@ func GetImageSecurityReport() (string, error) {
 
 	return sb.String(), nil
 }
-
