@@ -92,6 +92,75 @@ cd ..
 go run cmd/main.go
 ```
 
+## ⚙️ Configuration
+
+All runtime behaviour is driven through environment variables (loaded from `.env`):
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `GEMINI_API_KEY` | _(required)_ | Google Gemini API key. |
+| `TELEGRAM_BOT_TOKEN` | _(required)_ | Telegram bot token from @BotFather. |
+| `AUTHORIZED_CHAT_IDS` | _(required)_ | Comma-separated Telegram chat IDs allowed to control the bot. Every operator receives every alert. |
+| `AUTHORIZED_CHAT_ID` | _(legacy)_ | Single-ID fallback honored when `AUTHORIZED_CHAT_IDS` is unset. |
+| `LLM_PROVIDER` | `gemini` | `gemini` or `local` (OpenAI-compatible endpoint). |
+| `LLM_BASE_URL` | _(empty)_ | Base URL for the local LLM endpoint (e.g. LM Studio, Ollama). |
+| `LLM_MODEL` | _(empty)_ | Model name when using a local LLM. |
+| `LOCAL_LLM_API_KEY` | `lm-studio` | API key for the local LLM endpoint. |
+| `AUTOPILOT_ENABLED` | `false` | When `true`, auto-restart failed containers (max 3 attempts before HITL handoff). |
+| `ALERT_CPU_THRESHOLD` | `80.0` | Sustained CPU percentage that triggers an alert. |
+| `ALERT_CPU_DURATION` | `5` | Minutes of sustained high CPU before alerting. |
+| `ALERT_COOLDOWN_MINUTES` | `15` | Minimum minutes between repeat alerts for the same container. |
+| `METRICS_HISTORY_SIZE` | `60` | Rolling window of metric points retained in memory. |
+| `RCA_LOG_LINES` | `200` | Log lines passed to the AI for root-cause analysis. |
+| `AI_TIMEOUT_SECONDS` | `60` | Hard timeout on every Gemini / local-LLM round trip. |
+| `AI_RETRY_ATTEMPTS` | `3` | Total attempts per AI call before giving up. |
+| `AI_RETRY_BASE_DELAY_MS` | `1000` | Initial backoff between AI retries; doubles per attempt. |
+| `AI_DESTRUCTIVE_ALLOWED` | `false` | Set `true` to let the AI call `Stop`/`Restart` directly. Default forces HITL. |
+| `RATE_LIMIT_PER_MINUTE` | `30` | Max commands per minute per operator (token bucket). |
+| `TELEGRAM_QUEUE_SIZE` | `256` | Bounded backlog for the async broadcaster. |
+| `HEALTH_PORT` | _(empty)_ | Port for the `/health` JSON endpoint. Empty = disabled. |
+| `AUDIT_LOG_PATH` | `audit.log` | Path for the structured JSON-line audit log. |
+| `AUDIT_LOG_MAX_SIZE_MB` | `10` | Rotate audit log when it exceeds this many MB. |
+| `AUDIT_LOG_MAX_FILES` | `5` | Number of rotated audit files retained. |
+| `MONITOR_URLS` | _(empty)_ | Comma-separated URLs probed each minute for HTTP health. |
+
+## 🧠 Deep Root-Cause Analysis
+
+When a container goes down — whether through an operator's "🔍 Siasat Punca" button or the autopilot loop — Gopher-Ops assembles a **three-block evidence bundle** before consulting the AI:
+
+1. **Post-mortem inspect block** — exit code (with Unix-signal interpretation), `OOMKilled` flag, restart count, started/finished timestamps, memory & CPU limits, and the last five health-check probes.
+2. **System metrics snapshot** — host CPU/RAM history for the 15 minutes leading up to the failure, so the model can correlate the crash with load spikes.
+3. **Deep log tail** — 200 lines by default (tune with `RCA_LOG_LINES`), enough to capture stack traces and cascading failures that the old 10-line window missed.
+
+The diagnosis prompt explicitly instructs the model to classify the failure (OOM / panic / healthcheck / dependency / config), separate **root cause from symptom**, and cite evidence from the bundle. This is what upgrades RCA from "guess from a few log lines" to genuine forensic reasoning.
+
+## 🛡️ Reliability, Safety & Observability
+
+Gopher-Ops is engineered to run unattended in production. Highlights:
+
+- **Shared Docker client** — one socket connection reused across all packages, eliminating per-call connection churn.
+- **Bounded Docker & AI calls** — every Docker request and LLM round-trip runs under a `context.WithTimeout`; a stalled daemon or hung API cannot freeze the bot.
+- **Atomic state writes** — `state.json` is written via tmp + rename so a crash mid-write cannot corrupt the restart-tracker.
+- **Structured audit log** — every action (autopilot decisions, AI tool calls, manual buttons, alerts, boot/shutdown) is appended as JSON-line records to `audit.log`. Reconstruct any incident long after the Telegram thread has scrolled.
+- **HITL-by-default safety mode** — the AI cannot directly execute `Stop`/`Restart` unless `AI_DESTRUCTIVE_ALLOWED=true`; otherwise it must route those through the operator's confirmation buttons.
+- **Markdown sanitization** — untrusted strings (container names, log payloads) are escaped before being rendered, so a hostile log line cannot break formatting or smuggle styling.
+- **Alert cooldown** — flapping containers won't spam the chat; repeat alerts for the same target are suppressed for `ALERT_COOLDOWN_MINUTES`.
+- **Bounded RCA cache** — entries older than 1 hour, or referring to containers that no longer exist, are evicted each tick.
+- **Structured logging** — Go's `log/slog` emits key-value fields (container ID, action, error) suitable for log aggregators.
+- **Graceful shutdown** — `SIGINT` / `SIGTERM` cancel the update loop and stop the background monitor cleanly.
+- **Self-healing monitor** — the background goroutine is wrapped in panic recovery; if it crashes, it auto-restarts after 5 seconds without taking down the bot.
+
+## 🚢 Production Deployment
+
+Designed to be deployed and forgotten. Key production-grade properties:
+
+- **Multi-operator broadcast** — set `AUTHORIZED_CHAT_IDS=111,222,333` to fan every alert to your full on-call rotation. No single point of failure if one operator's phone is dead.
+- **Async Telegram queue** — alerts are enqueued and drained by a dedicated worker. The monitor loop never blocks on Telegram API latency, so a slow API cannot stall container-state polling.
+- **Per-operator rate limiting** — token-bucket caps commands at `RATE_LIMIT_PER_MINUTE` per chat (default 30). A compromised account cannot weaponize the AI to burn through your Gemini quota.
+- **AI retry with exponential backoff** — every Gemini / local-LLM call retries `AI_RETRY_ATTEMPTS` times (default 3) with `1s → 2s → 4s` backoff. Transient 503s or network blips no longer mean a missed diagnosis.
+- **HTTP `/health` endpoint** — set `HEALTH_PORT=8080` to expose `{"status":"ok","uptime_seconds":N}` for Kubernetes liveness probes, uptime monitors, or load balancers.
+- **Audit log rotation** — `audit.log` rotates at `AUDIT_LOG_MAX_SIZE_MB` (default 10 MB), keeping `AUDIT_LOG_MAX_FILES` historical copies (default 5). Disk cannot fill from forensic logging.
+
 ## 🎮 ChatOps Usage
 
 Once the bot is running, simply PM it on Telegram to start managing your infrastructure:
@@ -104,14 +173,20 @@ Once the bot is running, simply PM it on Telegram to start managing your infrast
 ```text
 .
 ├── cmd/
-│   └── main.go           # Bot entry point & Telegram handler
+│   └── main.go           # Bot entry point, Telegram handler, graceful shutdown
 ├── pkg/
 │   ├── actions/          # Docker & Terraform execution logic
-│   ├── ai/               # Gemini AI integration & prompt engineering
-│   ├── mcp/              # Model Context Protocol (K8s) manager
-│   └── monitor/          # System metrics & container tracking
+│   ├── ai/               # Gemini & local-LLM agents, tool dispatch, retry/backoff
+│   ├── audit/            # Structured JSON-line audit log (with rotation)
+│   ├── docker/           # Shared Docker client singleton (timeout-bounded calls)
+│   ├── health/           # HTTP /health endpoint for external probes
+│   ├── mcp/              # Model Context Protocol (Kubernetes) manager
+│   ├── monitor/          # Metrics, container tracking, crash-context inspect
+│   ├── notify/           # Async multi-operator Telegram broadcaster
+│   └── ratelimit/        # Per-chat token-bucket throttling
 ├── terraform/            # IaC for the microservices lab
 ├── .github/workflows/    # CI/CD (Go tests & TF validation)
+├── .env.example          # Template for required environment variables
 ├── demo-k8s.yaml         # Sample K8s manifest
 └── README.md             # You are here!
 ```

@@ -8,7 +8,10 @@
 # Environment variables
 .env
 .env.*
+!.env.example
 state.json
+state.json.tmp
+audit.log
 
 # Binaries
 gopher-ops

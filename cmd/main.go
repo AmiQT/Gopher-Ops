@@ -1,50 +1,146 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
-	"log"
+	"log/slog"
 	"os"
+	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
+	"syscall"
+	"time"
 
 	"gopher-ops/pkg/actions"
 	"gopher-ops/pkg/ai"
+	"gopher-ops/pkg/audit"
+	"gopher-ops/pkg/health"
 	"gopher-ops/pkg/monitor"
-
-	"sync"
-	"time"
+	"gopher-ops/pkg/notify"
+	"gopher-ops/pkg/ratelimit"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 )
 
-func main() {
-	fmt.Println("🤖 Booting up Gopher-Ops SRE Telegram Bot...")
+const (
+	stateFile       = "state.json"
+	defaultRCALines = 200
+	rcaCacheTTL     = 1 * time.Hour
+)
 
-	err := godotenv.Load()
-	if err != nil {
-		log.Println("⚠️  No .env file found. Make sure credentials are set!")
+// markdownEscaper neutralizes Telegram Markdown specials in untrusted strings
+// (container names, log payloads) so a crafted log line cannot break rendering
+// or smuggle formatting into operator alerts.
+var markdownEscaper = strings.NewReplacer(
+	"_", "\\_",
+	"*", "\\*",
+	"`", "\\`",
+	"[", "\\[",
+)
+
+func safeMD(s string) string { return markdownEscaper.Replace(s) }
+
+// atomicWriteFile writes via tmp + rename so a crash mid-write cannot leave a
+// half-written state.json that would corrupt the next boot.
+func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
+	tmp := path + ".tmp"
+	if err := os.WriteFile(tmp, data, perm); err != nil {
+		return err
 	}
+	return os.Rename(tmp, filepath.Clean(path))
+}
+
+func main() {
+	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
+		Level: slog.LevelInfo,
+	})))
+
+	slog.Info("🤖 Booting up Gopher-Ops SRE Telegram Bot...")
+
+	if err := godotenv.Load(); err != nil {
+		slog.Warn("No .env file found — credentials must be set via environment")
+	}
+
+	if p := os.Getenv("AUDIT_LOG_PATH"); p != "" {
+		audit.SetPath(p)
+	}
+	var auditMaxBytes int64 = 10 * 1024 * 1024
+	if v := os.Getenv("AUDIT_LOG_MAX_SIZE_MB"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			auditMaxBytes = n * 1024 * 1024
+		}
+	}
+	auditMaxFiles := 5
+	if v := os.Getenv("AUDIT_LOG_MAX_FILES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			auditMaxFiles = n
+		}
+	}
+	audit.SetRotation(auditMaxBytes, auditMaxFiles)
+	audit.Log(audit.Event{Type: "boot", Actor: "system", Status: "ok"})
 
 	apiKey := os.Getenv("GEMINI_API_KEY")
 	if apiKey == "" {
-		log.Fatal("❌ GEMINI_API_KEY is not set.")
+		slog.Error("GEMINI_API_KEY is not set")
+		os.Exit(1)
 	}
 
 	tgToken := os.Getenv("TELEGRAM_BOT_TOKEN")
 	if tgToken == "" {
-		log.Fatal("❌ TELEGRAM_BOT_TOKEN is not set.")
+		slog.Error("TELEGRAM_BOT_TOKEN is not set")
+		os.Exit(1)
 	}
 
-	authIDStr := os.Getenv("AUTHORIZED_CHAT_ID")
-	if authIDStr == "" {
-		log.Fatal("❌ AUTHORIZED_CHAT_ID is not set in .env. Setup required for production safety.")
-	}
-	authorizedChatID, err := strconv.ParseInt(authIDStr, 10, 64)
+	authorizedIDs, authorizedSet, err := parseAuthorizedChatIDs()
 	if err != nil {
-		log.Fatalf("❌ AUTHORIZED_CHAT_ID must be a valid number. Error: %v", err)
+		slog.Error("Authorized chat IDs invalid", "error", err)
+		os.Exit(1)
 	}
+	if len(authorizedIDs) == 0 {
+		slog.Error("AUTHORIZED_CHAT_IDS (or AUTHORIZED_CHAT_ID) is not set — required for production safety")
+		os.Exit(1)
+	}
+	slog.Info("Authorized operators configured", "count", len(authorizedIDs))
+
+	// Configurable thresholds
+	cpuThreshold := 80.0
+	if v := os.Getenv("ALERT_CPU_THRESHOLD"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			cpuThreshold = f
+		}
+	}
+
+	cpuDuration := 5
+	if v := os.Getenv("ALERT_CPU_DURATION"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			cpuDuration = n
+		}
+	}
+
+	if v := os.Getenv("METRICS_HISTORY_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			monitor.SetMetricsHistorySize(n)
+		}
+	}
+
+	alertCooldown := 15 * time.Minute
+	if v := os.Getenv("ALERT_COOLDOWN_MINUTES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			alertCooldown = time.Duration(n) * time.Minute
+		}
+	}
+
+	rateLimit := 30.0
+	if v := os.Getenv("RATE_LIMIT_PER_MINUTE"); v != "" {
+		if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+			rateLimit = f
+		}
+	}
+	limiter := ratelimit.New(rateLimit)
 
 	// 1. Initialize AI Agent
 	llmProvider := os.Getenv("LLM_PROVIDER")
@@ -59,104 +155,156 @@ func main() {
 		ModelName: os.Getenv("LLM_MODEL"),
 	}
 
-	// Adjust API key if using local
 	if llmProvider == "local" {
-		localKey := os.Getenv("LOCAL_LLM_API_KEY")
-		if localKey != "" {
+		if localKey := os.Getenv("LOCAL_LLM_API_KEY"); localKey != "" {
 			aiCfg.APIKey = localKey
 		} else {
-			aiCfg.APIKey = "lm-studio" // Default for LM Studio
+			aiCfg.APIKey = "lm-studio"
 		}
 	}
 
 	agent, err := ai.NewAgent(aiCfg)
 	if err != nil {
-		log.Fatalf("❌ Failed to initialize AI Agent (%s): %v", llmProvider, err)
+		slog.Error("Failed to initialize AI agent", "provider", llmProvider, "error", err)
+		os.Exit(1)
 	}
 	defer agent.Close()
 
 	// 2. Initialize Telegram Bot
 	bot, err := tgbotapi.NewBotAPI(tgToken)
 	if err != nil {
-		log.Panic(err)
+		slog.Error("Failed to initialize Telegram bot", "error", err)
+		os.Exit(1)
+	}
+	bot.Debug = false
+	slog.Info("✅ Authorized on Telegram", "username", bot.Self.UserName)
+
+	// 3. Graceful shutdown context
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// 4. Optional /health HTTP endpoint
+	if port := os.Getenv("HEALTH_PORT"); port != "" {
+		health.New(port).Start(ctx)
 	}
 
-	bot.Debug = false
-	log.Printf("✅ Authorized on Telegram account %s", bot.Self.UserName)
+	// 5. Async Telegram broadcaster (fan-out to all authorized operators)
+	queueSize := 256
+	if v := os.Getenv("TELEGRAM_QUEUE_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			queueSize = n
+		}
+	}
+	broadcaster := notify.NewQueue(bot, authorizedIDs, queueSize)
+	go broadcaster.Run(ctx)
 
-	// 3. Start Background Monitor
-	go startBackgroundMonitor(bot, agent, authorizedChatID)
+	// 6. Start Background Monitor with panic recovery and auto-restart
+	go func() {
+		for {
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						slog.Error("🔥 Background monitor panicked — restarting", "panic", r)
+					}
+				}()
+				startBackgroundMonitor(ctx, broadcaster, agent, cpuThreshold, cpuDuration, alertCooldown)
+			}()
 
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(5 * time.Second):
+				slog.Warn("Background monitor restarting after crash...")
+			}
+		}
+	}()
+
+	// 5. Telegram update loop
 	u := tgbotapi.NewUpdate(0)
 	u.Timeout = 60
-
 	updates := bot.GetUpdatesChan(u)
 
-	// Keep track of some simple state. In a real app you'd map by ChatID
-	for update := range updates {
-		if update.CallbackQuery != nil {
-			// Security Check for Callbacks
-			if update.CallbackQuery.Message.Chat.ID != authorizedChatID {
-				callbackConfig := tgbotapi.NewCallback(update.CallbackQuery.ID, "❌ Kau siapa siot?")
-				bot.Request(callbackConfig)
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("🛑 Shutdown signal received — stopping bot")
+			audit.Log(audit.Event{Type: "shutdown", Actor: "system", Status: "ok"})
+			bot.StopReceivingUpdates()
+			return
+		case update, ok := <-updates:
+			if !ok {
+				return
+			}
+			if update.CallbackQuery != nil {
+				chatID := update.CallbackQuery.Message.Chat.ID
+				if !authorizedSet[chatID] {
+					callbackConfig := tgbotapi.NewCallback(update.CallbackQuery.ID, "❌ Kau siapa siot?")
+					bot.Request(callbackConfig)
+					continue
+				}
+				if !limiter.Allow(chatID) {
+					callbackConfig := tgbotapi.NewCallback(update.CallbackQuery.ID, "⏳ Slow down — rate limited.")
+					bot.Request(callbackConfig)
+					continue
+				}
+				handleCallbackQuery(bot, agent, update.CallbackQuery)
 				continue
 			}
 
-			// User clicked an inline button
-			handleCallbackQuery(bot, agent, update.CallbackQuery)
-			continue
-		}
-
-		if update.Message == nil { // ignore any non-Message updates
-			continue
-		}
-
-		// Security Check for Messages
-		if update.Message.Chat.ID != authorizedChatID {
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, "❌ Warganegara asing dilarang masuk. Kau sapa takde access level nak borak dengan aku bro. GG.")
-			bot.Send(msg)
-			continue
-		}
-
-		if update.Message.IsCommand() {
-			msgText := ""
-			switch update.Message.Command() {
-			case "start":
-				msgText = "🤖 **Gopher-Ops Ready!**\nSebut je apa kau nak aku buat kat server ni mat."
-			case "help":
-				msgText = "📖 **COMMANDS:**\n/start - Mula sembang\n/help - Tengok ni\n/status - Check bot & AI status\n/reset - Clear state"
-			case "status":
-				// Get live metrics for status
-				health, _ := monitor.GetSystemHealth()
-				provider := os.Getenv("LLM_PROVIDER")
-				model := os.Getenv("LLM_MODEL")
-				autoPilot := "DISABLED ❌"
-				if os.Getenv("AUTOPILOT_ENABLED") == "true" {
-					autoPilot = "ACTIVE ✅ (Self-Healing On)"
-				}
-
-				msgText = fmt.Sprintf("🤖 **GOPHER-OPS STATUS**\n\n"+
-					"🧠 **AI Engine:** %s (%s)\n"+
-					"🤖 **Autopilot:** %s\n\n"+
-					"📊 **Live Metrics:**\n%s",
-					strings.ToUpper(provider), model, autoPilot, health)
-			case "reset":
-				// Manual state reset via Telegram command
-				os.Remove("state.json")
-				msgText = "🧹 **STATE CLEARED!** Hafiz dah lupa sejarah lama. Kita mula hidup baru."
-			default:
-				msgText = "Command apa tu mat? Aku tak faham ah. 😂"
+			if update.Message == nil {
+				continue
 			}
-			msg := tgbotapi.NewMessage(update.Message.Chat.ID, msgText)
-			msg.ParseMode = "Markdown"
-			bot.Send(msg)
-			continue
-		}
 
-		if !update.Message.IsCommand() {
-			// Normal chat message
+			chatID := update.Message.Chat.ID
+			if !authorizedSet[chatID] {
+				msg := tgbotapi.NewMessage(chatID, "❌ Warganegara asing dilarang masuk. Kau sapa takde access level nak borak dengan aku bro. GG.")
+				bot.Send(msg)
+				audit.Log(audit.Event{
+					Type: "alert", Actor: "system", Action: "unauthorized_access",
+					Target: strconv.FormatInt(chatID, 10), Status: "info",
+				})
+				continue
+			}
+
+			if !limiter.Allow(chatID) {
+				msg := tgbotapi.NewMessage(chatID, "⏳ Whoa, slow down bro! Limit kau dah cecah. Try semula dalam seminit.")
+				bot.Send(msg)
+				continue
+			}
+
+			if update.Message.IsCommand() {
+				msgText := ""
+				switch update.Message.Command() {
+				case "start":
+					msgText = "🤖 **Gopher-Ops Ready!**\nSebut je apa kau nak aku buat kat server ni mat."
+				case "help":
+					msgText = "📖 **COMMANDS:**\n/start - Mula sembang\n/help - Tengok ni\n/status - Check bot & AI status\n/reset - Clear state"
+				case "status":
+					health, _ := monitor.GetSystemHealth()
+					provider := os.Getenv("LLM_PROVIDER")
+					model := os.Getenv("LLM_MODEL")
+					autoPilot := "DISABLED ❌"
+					if os.Getenv("AUTOPILOT_ENABLED") == "true" {
+						autoPilot = "ACTIVE ✅ (Self-Healing On)"
+					}
+					msgText = fmt.Sprintf("🤖 **GOPHER-OPS STATUS**\n\n"+
+						"🧠 **AI Engine:** %s (%s)\n"+
+						"🤖 **Autopilot:** %s\n\n"+
+						"📊 **Live Metrics:**\n%s",
+						strings.ToUpper(provider), model, autoPilot, health)
+				case "reset":
+					os.Remove("state.json")
+					msgText = "🧹 **STATE CLEARED!** Hafiz dah lupa sejarah lama. Kita mula hidup baru."
+				default:
+					msgText = "Command apa tu mat? Aku tak faham ah. 😂"
+				}
+				msg := tgbotapi.NewMessage(update.Message.Chat.ID, msgText)
+				msg.ParseMode = "Markdown"
+				bot.Send(msg)
+				continue
+			}
+
 			input := strings.TrimSpace(update.Message.Text)
-
 			if input == "clear" {
 				agent.ResetSession()
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "🧹 Gopher-Ops: Chat memory cleared! Token history reset jadi 0. Jimat token LFG! ✨")
@@ -165,36 +313,30 @@ func main() {
 				continue
 			}
 
-			// Send a loading message
 			msgLoader := tgbotapi.NewMessage(update.Message.Chat.ID, "🧠 Gopher-Ops is thinking...")
 			sentLoader, _ := bot.Send(msgLoader)
 
-			// Process via AI
 			response, intents, err := agent.ProcessRequest(input)
 			if err != nil {
+				slog.Error("AI ProcessRequest failed", "error", err)
 				respMsg := tgbotapi.NewEditMessageText(update.Message.Chat.ID, sentLoader.MessageID, fmt.Sprintf("❌ Error borak: %v", err))
 				respMsg.ParseMode = "Markdown"
 				bot.Send(respMsg)
 				continue
 			}
 
-			// Edit message with final AI response
 			respMsg := tgbotapi.NewEditMessageText(update.Message.Chat.ID, sentLoader.MessageID, response)
 			respMsg.ParseMode = "Markdown"
 
-			// Build Inline Keyboard if there are intentions
 			if len(intents) > 0 {
 				var rows [][]tgbotapi.InlineKeyboardButton
 				for _, intent := range intents {
-					callbackData := fmt.Sprintf("%s:%s", intent.Action, intent.Target) // e.g. "StopContainer:0ccfe811"
-
+					callbackData := fmt.Sprintf("%s:%s", intent.Action, intent.Target)
 					btnText := ""
 					targetName := intent.Target
 					if intent.Target != "" {
-						// Attempt to get a human-readable name like "/test-redis" instead of just "0ccfe811"
 						foundName := monitor.GetContainerName(intent.Target)
 						if foundName != "" && foundName != intent.Target {
-							// safe slicing
 							shortID := intent.Target
 							if len(shortID) > 8 {
 								shortID = shortID[:8]
@@ -229,7 +371,6 @@ func main() {
 					btn := tgbotapi.NewInlineKeyboardButtonData(btnText, callbackData)
 					rows = append(rows, tgbotapi.NewInlineKeyboardRow(btn))
 				}
-
 				keyboard := tgbotapi.NewInlineKeyboardMarkup(rows...)
 				respMsg.ReplyMarkup = &keyboard
 			}
@@ -239,13 +380,11 @@ func main() {
 	}
 }
 
-// handleCallbackQuery processes button clicks from the user in Telegram
+// handleCallbackQuery processes button clicks from the user in Telegram.
 func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbotapi.CallbackQuery) {
-	// Acknowledge the callback immediately so the button stops loading
 	callbackConfig := tgbotapi.NewCallback(callback.ID, "🧠 Gopher-Ops is processing...")
 	bot.Request(callbackConfig)
 
-	// Parse Action:Target
 	parts := strings.Split(callback.Data, ":")
 	if len(parts) != 2 {
 		bot.Send(tgbotapi.NewMessage(callback.Message.Chat.ID, "❌ Callback data rosak bro."))
@@ -255,11 +394,19 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 	action := parts[0]
 	target := parts[1]
 
+	auditAction := func(act, tgt string, err error) {
+		status, detail := "ok", ""
+		if err != nil {
+			status, detail = "error", err.Error()
+		}
+		audit.Log(audit.Event{Type: "action", Actor: "user", Action: act, Target: tgt, Status: status, Detail: detail})
+	}
+
 	var resMsg string
-	// Execute Action
 	switch action {
 	case "StopContainer":
 		_, err := actions.StopContainer(target)
+		auditAction(action, target, err)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ GG! Takleh stop %s: %v", target, err)
 		} else {
@@ -267,6 +414,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		}
 	case "StartContainer":
 		_, err := actions.StartContainer(target)
+		auditAction(action, target, err)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ GG! Takleh start %s: %v", target, err)
 		} else {
@@ -274,6 +422,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		}
 	case "RestartContainer":
 		_, err := actions.RestartContainer(target)
+		auditAction(action, target, err)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ GG! Takleh restart %s: %v", target, err)
 		} else {
@@ -281,28 +430,29 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		}
 	case "ClearCache":
 		res := actions.ClearCache()
+		auditAction(action, "", nil)
 		resMsg = fmt.Sprintf("✅ Selesai! %s 🧹", res)
 	case "ViewLogs":
 		logs, err := actions.GetContainerLogs(target)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ GG! Takleh tarik log %s: %v", target, err)
 		} else {
-			resMsg = fmt.Sprintf("📜 **Logs for %s:**\n```\n%s\n```", target, logs)
+			resMsg = fmt.Sprintf("📜 **Logs for %s:**\n```\n%s\n```", safeMD(target), logs)
 		}
 	case "AnalyzeRCA":
-		logs, _ := actions.GetContainerLogs(target)
 		name := monitor.GetContainerName(target)
 
-		// Send a "Processing" message because AI takes time
 		msgProc := tgbotapi.NewMessage(callback.Message.Chat.ID, "🔍 *Gopher-Ops sedang menganalisis log... Sabar jap.*")
 		msgProc.ParseMode = "Markdown"
 		bot.Send(msgProc)
 
-		analysis, err := agent.DiagnoseIssue(name, logs)
+		evidence := buildRCAEvidence(target)
+		analysis, err := agent.DiagnoseIssue(name, evidence)
+		auditAction("AnalyzeRCA", target, err)
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ Aduh, AI pening nak analyze: %v", err)
 		} else {
-			resMsg = fmt.Sprintf("🧐 **ANALISIS RCA: %s**\n\n%s", name, analysis)
+			resMsg = fmt.Sprintf("🧐 **ANALISIS RCA: %s**\n\n%s", safeMD(name), analysis)
 		}
 	case "TerraformApply":
 		out, err := actions.TerraformApply()
@@ -354,7 +504,6 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 			resMsg = fmt.Sprintf("⚙️ **ANALISIS KONFIGURASI: %s**\n\n%s", name, analysis)
 		}
 	case "VisualMetrics":
-
 		metrics, _ := monitor.GetVisualMetrics()
 		resMsg = metrics
 	default:
@@ -365,126 +514,215 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 	bot.Send(msg)
 }
 
-// startBackgroundMonitor checks system health every X minutes and alerts the user
-func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64) {
-	log.Println("🩺 Background monitor started...")
-
-	// Initial state
-	previousStates, err := monitor.GetContainerStates()
-	if err != nil {
-		log.Printf("⚠️ Monitor error during init: %v", err)
+// buildRCAEvidence assembles the inspect post-mortem, system metric snapshot,
+// and a deep log tail into a single text bundle for the AI. This is what
+// upgrades RCA from "guess from 10 log lines" to "reason about exit codes,
+// OOM flags, restart history, system load, and 200 lines of context."
+func buildRCAEvidence(containerID string) string {
+	rcaLines := defaultRCALines
+	if v := os.Getenv("RCA_LOG_LINES"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			rcaLines = n
+		}
 	}
 
-	// Tracker for auto-restarts and alert cooldowns
+	var sb strings.Builder
+
+	if crash, err := monitor.GetCrashContext(containerID); err == nil {
+		sb.WriteString(crash.FormatForAI())
+		sb.WriteString("\n")
+	} else {
+		sb.WriteString("=== CONTAINER POST-MORTEM ===\n(inspect unavailable: " + err.Error() + ")\n\n")
+	}
+
+	sb.WriteString(monitor.GetMetricsSnapshot(15))
+	sb.WriteString("\n")
+
+	logs, err := actions.GetContainerLogsN(containerID, rcaLines)
+	if err != nil {
+		sb.WriteString("=== CONTAINER LOGS ===\n(unavailable: " + err.Error() + ")\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("=== CONTAINER LOGS (last %d lines) ===\n%s\n", rcaLines, logs))
+	}
+
+	return sb.String()
+}
+
+// startBackgroundMonitor checks system health every minute and broadcasts
+// alerts to every authorized operator via the async notify queue. The
+// broadcaster decouples this loop from Telegram API latency, so a slow API
+// cannot stall container-state polling.
+func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agent ai.AIAgent, cpuThreshold float64, cpuDuration int, alertCooldown time.Duration) {
+	slog.Info("🩺 Background monitor started",
+		"cpu_threshold", cpuThreshold,
+		"cpu_duration_min", cpuDuration,
+		"alert_cooldown", alertCooldown)
+
+	previousStates, err := monitor.GetContainerStates()
+	if err != nil {
+		slog.Warn("Monitor init error — starting with empty state", "error", err)
+		previousStates = make(map[string]monitor.ContainerStatus)
+	}
+
 	restartTracker := make(map[string]int)
 	alertState := make(map[string]string)
+	alertSentAt := make(map[string]time.Time)
 
-	// Helper to save state with Mutex to prevent race conditions
 	var mu sync.Mutex
 	saveState := func() {
 		mu.Lock()
 		defer mu.Unlock()
 
 		state := struct {
-			Restarts map[string]int    `json:"restarts"`
-			Alerts   map[string]string `json:"alerts"`
+			Restarts    map[string]int       `json:"restarts"`
+			Alerts      map[string]string    `json:"alerts"`
+			AlertSentAt map[string]time.Time `json:"alert_sent_at"`
 		}{
-			Restarts: restartTracker,
-			Alerts:   alertState,
+			Restarts:    restartTracker,
+			Alerts:      alertState,
+			AlertSentAt: alertSentAt,
 		}
 		data, _ := json.Marshal(state)
-		// Atomic-like write: write then rename if we were on Linux,
-		// but on Windows we'll just be careful with the file handle.
-		os.WriteFile("state.json", data, 0644)
+		if err := atomicWriteFile(stateFile, data, 0644); err != nil {
+			slog.Warn("state.json write failed", "error", err)
+		}
 	}
 
-	// Load existing state if any
-	if file, err := os.ReadFile("state.json"); err == nil {
+	if file, err := os.ReadFile(stateFile); err == nil {
 		var state struct {
-			Restarts map[string]int    `json:"restarts"`
-			Alerts   map[string]string `json:"alerts"`
+			Restarts    map[string]int       `json:"restarts"`
+			Alerts      map[string]string    `json:"alerts"`
+			AlertSentAt map[string]time.Time `json:"alert_sent_at"`
 		}
 		if err := json.Unmarshal(file, &state); err == nil {
-			restartTracker = state.Restarts
-			alertState = state.Alerts
-			log.Println("💾 State loaded from state.json")
+			if state.Restarts != nil {
+				restartTracker = state.Restarts
+			}
+			if state.Alerts != nil {
+				alertState = state.Alerts
+			}
+			if state.AlertSentAt != nil {
+				alertSentAt = state.AlertSentAt
+			}
+			slog.Info("💾 State loaded from state.json")
+		} else {
+			slog.Warn("state.json corrupt — starting fresh", "error", err)
 		}
 	}
 
-	// Token Saver: Cache for RCA results
 	rcaCache := make(map[string]struct {
 		Result    string
 		Timestamp time.Time
 	})
 
 	ticker := time.NewTicker(1 * time.Minute)
-	for range ticker.C {
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			slog.Info("Background monitor stopping")
+			return
+		case <-ticker.C:
+		}
+
 		currentStates, err := monitor.GetContainerStates()
 		if err != nil {
-			log.Printf("⚠️ Monitor loop error: %v", err)
+			slog.Warn("Monitor loop error", "error", err)
 			continue
+		}
+
+		// Evict RCA cache entries that are stale OR refer to containers that
+		// no longer exist. Without this, the cache grows unboundedly.
+		for k, v := range rcaCache {
+			if time.Since(v.Timestamp) > rcaCacheTTL {
+				delete(rcaCache, k)
+				continue
+			}
+			if _, alive := currentStates[k]; !alive {
+				delete(rcaCache, k)
+			}
 		}
 
 		autoPilot := os.Getenv("AUTOPILOT_ENABLED") == "true"
 
 		for id, current := range currentStates {
 			prev, exists := previousStates[id]
+			safeName := safeMD(current.Name)
 
-			// Detect failure
 			if exists && prev.State == "running" && current.State != "running" {
 				count := restartTracker[id]
 
 				if autoPilot && count < 3 {
-					// --- AUTO-PILOT MODE ---
 					restartTracker[id]++
-					log.Printf("🤖 Auto-Pilot: Attempt #%d for %s (%s).", restartTracker[id], current.Name, id)
+					slog.Info("🤖 Auto-Pilot restart", "attempt", restartTracker[id], "container", current.Name, "id", id)
+					audit.Log(audit.Event{
+						Type: "autopilot", Actor: "ai", Action: "RestartContainer",
+						Target: id, Status: "info",
+						Detail: fmt.Sprintf("attempt %d/3 for %s", restartTracker[id], current.Name),
+					})
 
-					// Token Saver: Check cache first
 					var analysis string
 					if cache, ok := rcaCache[id]; ok && time.Since(cache.Timestamp) < 10*time.Minute {
 						analysis = cache.Result + "\n\n*(Nota: Analisis dari cache 10 minit terakhir)*"
 					} else {
-						logs, _ := actions.GetContainerLogs(id)
-						analysis, _ = agent.DiagnoseIssue(current.Name, logs)
+						evidence := buildRCAEvidence(id)
+						var diagErr error
+						analysis, diagErr = agent.DiagnoseIssue(current.Name, evidence)
+						if diagErr != nil {
+							slog.Warn("DiagnoseIssue failed during autopilot", "container", current.Name, "error", diagErr)
+							analysis = "*(Analisis AI tidak tersedia: " + safeMD(diagErr.Error()) + ")*"
+						}
 						rcaCache[id] = struct {
 							Result    string
 							Timestamp time.Time
 						}{Result: analysis, Timestamp: time.Now()}
 					}
 
-					actions.RestartContainer(id)
-
-					msgText := fmt.Sprintf("🤖 **AUTOPILOT ACTION! (Attempt %d/3)**\n\nContainer **%s** tadi DOWN. Aku dah tolong restartkan untuk kau!\n\n**Analisis AI:**\n%s", restartTracker[id], current.Name, analysis)
-					msg := tgbotapi.NewMessage(chatID, msgText)
-					msg.ParseMode = "Markdown"
-					bot.Send(msg)
-					alertState[id] = "autopilot_sent"
-					saveState()
-				} else if alertState[id] != "alert_sent" {
-					// --- MANUAL/SURRENDER MODE (With Spam Protection) ---
-					alertMsg := ""
-					if count >= 3 {
-						alertMsg = fmt.Sprintf("🚨 **CRITICAL ALERT!**\n\nContainer **%s** dah restart 3 kali tapi still DOWN mat. 💀 Aku dah 'surrender'. Kau kena check manual jap bro.", current.Name)
-						alertState[id] = "alert_sent" // Mark as sent so we don't spam
-					} else {
-						alertMsg = fmt.Sprintf("⚠️ **ALERT!** Container **%s** dah **DOWN**! (Status: %s)\nNak aku restart ke bro?", current.Name, current.State)
-						alertState[id] = "alert_sent"
+					if _, restartErr := actions.RestartContainer(id); restartErr != nil {
+						slog.Warn("Autopilot restart failed", "container", current.Name, "error", restartErr)
+						audit.Log(audit.Event{
+							Type: "autopilot", Actor: "ai", Action: "RestartContainer",
+							Target: id, Status: "error", Detail: restartErr.Error(),
+						})
 					}
 
-					msg := tgbotapi.NewMessage(chatID, alertMsg)
-					msg.ParseMode = "Markdown"
+					msgText := fmt.Sprintf("🤖 **AUTOPILOT ACTION! (Attempt %d/3)**\n\nContainer **%s** tadi DOWN. Aku dah tolong restartkan untuk kau!\n\n**Analisis AI:**\n%s",
+						restartTracker[id], safeName, analysis)
+					broadcaster.Broadcast(notify.Broadcast{Text: msgText, ParseMode: "Markdown"})
+					alertState[id] = "autopilot_sent"
+					alertSentAt[id] = time.Now()
+					saveState()
+				} else if shouldAlert(alertState[id], alertSentAt[id], alertCooldown) {
+					alertMsg := ""
+					if count >= 3 {
+						alertMsg = fmt.Sprintf("🚨 **CRITICAL ALERT!**\n\nContainer **%s** dah restart 3 kali tapi still DOWN mat. 💀 Aku dah 'surrender'. Kau kena check manual jap bro.", safeName)
+					} else {
+						alertMsg = fmt.Sprintf("⚠️ **ALERT!** Container **%s** dah **DOWN**! (Status: %s)\nNak aku restart ke bro?", safeName, safeMD(current.State))
+					}
+					alertState[id] = "alert_sent"
+					alertSentAt[id] = time.Now()
+					audit.Log(audit.Event{
+						Type: "alert", Actor: "system", Action: "container_down",
+						Target: id, Status: "info", Detail: current.Name,
+					})
+
 					btnRestart := tgbotapi.NewInlineKeyboardButtonData("🔄 Restart Now", "RestartContainer:"+id)
 					btnRCA := tgbotapi.NewInlineKeyboardButtonData("🔍 Siasat Punca (RCA)", "AnalyzeRCA:"+id)
-					msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnRestart), tgbotapi.NewInlineKeyboardRow(btnRCA))
-					bot.Send(msg)
+					keyboard := tgbotapi.NewInlineKeyboardMarkup(
+						tgbotapi.NewInlineKeyboardRow(btnRestart),
+						tgbotapi.NewInlineKeyboardRow(btnRCA),
+					)
+					broadcaster.Broadcast(notify.Broadcast{
+						Text: alertMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard,
+					})
 					saveState()
 				}
 			}
 
-			// Reset counter and alert state if container is healthy
 			if current.State == "running" {
 				if restartTracker[id] > 0 || alertState[id] != "" {
-					log.Printf("✨ %s is healthy again. Resetting trackers.", current.Name)
+					slog.Info("✨ Container healthy again — resetting trackers", "container", current.Name)
 					restartTracker[id] = 0
 					alertState[id] = ""
 					saveState()
@@ -492,35 +730,74 @@ func startBackgroundMonitor(bot *tgbotapi.BotAPI, agent ai.AIAgent, chatID int64
 			}
 		}
 
-		// --- NEW: HTTP PROBING ---
-		urlsStr := os.Getenv("MONITOR_URLS")
-		if urlsStr != "" {
-			urls := strings.Split(urlsStr, ",")
-			for _, u := range urls {
+		// HTTP endpoint probing
+		if urlsStr := os.Getenv("MONITOR_URLS"); urlsStr != "" {
+			for _, u := range strings.Split(urlsStr, ",") {
 				u = strings.TrimSpace(u)
 				status := monitor.CheckHTTP(u)
 				if !status.IsUp {
 					alertMsg := fmt.Sprintf("🌐 **HTTP ALERT!** Website [%s](%s) return error!\nStatus Code: **%d**\nCheck jap bro, kot-kot app hang.", u, u, status.StatusCode)
-					msg := tgbotapi.NewMessage(chatID, alertMsg)
-					msg.ParseMode = "Markdown"
-					bot.Send(msg)
+					broadcaster.Broadcast(notify.Broadcast{Text: alertMsg, ParseMode: "Markdown"})
 				}
 			}
 		}
 
-		// --- NEW: SUSTAINED LOAD ALERT (Idea 3) ---
-		// Check if CPU average is > 80% for the last 5 checks (minutes)
-		if monitor.GlobalMetricStore.CheckSustainedLoad(80.0, 5) {
-			alertMsg := "🔥 **SUSTAINED HIGH LOAD ALERT!**\n\nCPU load kau dah lebih **80%** untuk 5 minit berturut-turut bro! Server tengah berpeluh tu. 🥵\n\nNak aku check container mana yang makan resource paling banyak?"
-			msg := tgbotapi.NewMessage(chatID, alertMsg)
-			msg.ParseMode = "Markdown"
-
+		// Sustained CPU load alert
+		if monitor.GlobalMetricStore.CheckSustainedLoad(cpuThreshold, cpuDuration) {
+			alertMsg := fmt.Sprintf("🔥 **SUSTAINED HIGH LOAD ALERT!**\n\nCPU load kau dah lebih **%.0f%%** untuk %d minit berturut-turut bro! Server tengah berpeluh tu. 🥵\n\nNak aku check container mana yang makan resource paling banyak?", cpuThreshold, cpuDuration)
 			btnCheck := tgbotapi.NewInlineKeyboardButtonData("📊 Check Resource Hogs", "VisualMetrics:all")
-			msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnCheck))
-
-			bot.Send(msg)
+			keyboard := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnCheck))
+			broadcaster.Broadcast(notify.Broadcast{
+				Text: alertMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard,
+			})
 		}
 
 		previousStates = currentStates
 	}
+}
+
+// shouldAlert returns true when a fresh alert for `id` is allowed. It rate
+// limits repeat alerts so a flapping container cannot spam the operator.
+//   - first failure (status == ""): always alert
+//   - same failure within cooldown: suppress
+//   - same failure after cooldown elapsed: re-alert
+func shouldAlert(status string, lastSent time.Time, cooldown time.Duration) bool {
+	if status == "" {
+		return true
+	}
+	if lastSent.IsZero() {
+		return true
+	}
+	return time.Since(lastSent) > cooldown
+}
+
+// parseAuthorizedChatIDs accepts a comma-separated AUTHORIZED_CHAT_IDS env
+// (preferred), or a single AUTHORIZED_CHAT_ID for backwards compatibility,
+// and returns the list plus a set for O(1) lookup.
+func parseAuthorizedChatIDs() ([]int64, map[int64]bool, error) {
+	raw := os.Getenv("AUTHORIZED_CHAT_IDS")
+	if raw == "" {
+		raw = os.Getenv("AUTHORIZED_CHAT_ID")
+	}
+	if raw == "" {
+		return nil, nil, nil
+	}
+
+	var ids []int64
+	set := make(map[int64]bool)
+	for _, part := range strings.Split(raw, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		id, err := strconv.ParseInt(part, 10, 64)
+		if err != nil {
+			return nil, nil, fmt.Errorf("invalid chat ID %q: %w", part, err)
+		}
+		if !set[id] {
+			set[id] = true
+			ids = append(ids, id)
+		}
+	}
+	return ids, set, nil
 }
