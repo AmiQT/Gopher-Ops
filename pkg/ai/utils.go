@@ -64,5 +64,17 @@ func ExtractIntents(output string) []ActionIntent {
 		intents = append(intents, ActionIntent{Action: "VisualMetrics", Target: ""})
 	}
 
+	// CONTAINER STATS (per-container live CPU/RAM)
+	containerStatsRe := regexp.MustCompile(`ContainerStats\(\)`)
+	if containerStatsRe.MatchString(output) {
+		intents = append(intents, ActionIntent{Action: "ContainerStats", Target: ""})
+	}
+
+	// DISK USAGE (host filesystem usage)
+	diskRe := regexp.MustCompile(`DiskUsage\(\)`)
+	if diskRe.MatchString(output) {
+		intents = append(intents, ActionIntent{Action: "DiskUsage", Target: ""})
+	}
+
 	return intents
 }

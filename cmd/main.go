@@ -423,6 +423,10 @@ func main() {
 						btnText = "🛡️ Audit Security Level"
 					case "VisualMetrics":
 						btnText = "📊 Show System Pulse"
+					case "ContainerStats":
+						btnText = "📦 Live Container Stats"
+					case "DiskUsage":
+						btnText = "💾 Show Disk Usage"
 					case "InvestigateNetwork":
 						btnText = "🌐 Triage: Network " + targetName
 					case "CheckConfig":
@@ -567,6 +571,10 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 	case "VisualMetrics":
 		metrics, _ := monitor.GetVisualMetrics()
 		resMsg = metrics
+	case "ContainerStats":
+		resMsg = monitor.FormatContainerStats()
+	case "DiskUsage":
+		resMsg = monitor.FormatDiskUsage()
 	default:
 		resMsg = "Action tak jumpa wtf ahaha"
 	}
@@ -701,6 +709,15 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 		case <-ticker.C:
 		}
 
+		// Collect per-container CPU/RAM in the background; errors are non-fatal.
+		go func() {
+			collectCtx, collectCancel := context.WithTimeout(ctx, 30*time.Second)
+			defer collectCancel()
+			if err := monitor.CollectContainerStats(collectCtx); err != nil {
+				slog.Warn("container stats collection failed", "error", err)
+			}
+		}()
+
 		currentStates, err := monitor.GetContainerStates()
 		if err != nil {
 			slog.Warn("Monitor loop error", "error", err)
@@ -813,6 +830,27 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 				if !status.IsUp {
 					alertMsg := fmt.Sprintf("🌐 **HTTP ALERT!** Website [%s](%s) return error!\nStatus Code: **%d**\nCheck jap bro, kot-kot app hang.", u, u, status.StatusCode)
 					broadcaster.Broadcast(notify.Broadcast{Text: alertMsg, ParseMode: "Markdown"})
+				}
+			}
+		}
+
+		// Disk space alerts — read threshold from env (default 85%).
+		diskThreshold := 85.0
+		if v := os.Getenv("DISK_ALERT_THRESHOLD"); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+				diskThreshold = f
+			}
+		}
+		if alerts, err := monitor.CheckDiskAlerts(diskThreshold); err == nil {
+			for _, a := range alerts {
+				key := "disk:" + a.Mount
+				if shouldAlert(alertState[key], alertSentAt[key], alertCooldown) {
+					alertMsg := fmt.Sprintf("💾 **DISK ALERT!**\n\nMount **%s** dah `%.1f%%` penuh (%.1f / %.1f GB).\nKalau hit 100%% nanti container tak boleh write logs, app crash. Cleanup ASAP bro!",
+						a.Mount, a.UsedPct, a.UsedGB, a.TotalGB)
+					broadcaster.Broadcast(notify.Broadcast{Text: alertMsg, ParseMode: "Markdown"})
+					alertState[key] = "high"
+					alertSentAt[key] = time.Now()
+					audit.Log(audit.Event{Type: "alert", Actor: "system", Action: "disk_high", Target: a.Mount, Status: "fired"})
 				}
 			}
 		}
