@@ -729,6 +729,10 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 	restartTracker := make(map[string]int)
 	alertState := make(map[string]string)
 	alertSentAt := make(map[string]time.Time)
+	// crashLoopTimes tracks the timestamps of recent restarts per container so
+	// we can detect a crash-loop (N restarts within a time window) independently
+	// of the lifetime restart counter used by autopilot.
+	crashLoopTimes := make(map[string][]time.Time)
 
 	var mu sync.Mutex
 	saveState := func() {
@@ -790,6 +794,7 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 			restartTracker = make(map[string]int)
 			alertState = make(map[string]string)
 			alertSentAt = make(map[string]time.Time)
+			crashLoopTimes = make(map[string][]time.Time)
 			for k := range rcaCache {
 				delete(rcaCache, k)
 			}
@@ -931,11 +936,51 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 				}
 			}
 
+			// Crash-loop detection: record each restart timestamp and alert
+			// when 3+ restarts happen within a 5-minute window. This fires
+			// independently of the autopilot counter so it works even when
+			// AUTOPILOT_ENABLED=false.
+			if exists && prev.State == "running" && current.State != "running" {
+				now := time.Now()
+				window := 5 * time.Minute
+				times := crashLoopTimes[id]
+				// Prune entries outside the window.
+				cutoff := now.Add(-window)
+				filtered := times[:0]
+				for _, t := range times {
+					if t.After(cutoff) {
+						filtered = append(filtered, t)
+					}
+				}
+				filtered = append(filtered, now)
+				crashLoopTimes[id] = filtered
+
+				if len(filtered) >= 3 && alertState[id] != "crashloop" {
+					loopMsg := fmt.Sprintf(
+						"🔴 **CRASH LOOP DETECTED!**\n\nContainer **%s** dah restart **%d kali dalam 5 minit**. "+
+							"Ini bukan fluke — ada root cause serius. Kau kena check sekarang!\n\n"+
+							"Nak aku buat RCA?",
+						safeMD(current.Name), len(filtered))
+					btnRCA := tgbotapi.NewInlineKeyboardButtonData("🔍 Deep RCA", "AnalyzeRCA:"+id)
+					keyboard := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnRCA))
+					broadcaster.Broadcast(notify.Broadcast{Text: loopMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard})
+					alertState[id] = "crashloop"
+					alertSentAt[id] = now
+					metrics.AlertsTotal.WithLabelValues("crash_loop").Inc()
+					audit.Log(audit.Event{
+						Type: "alert", Actor: "system", Action: "crash_loop",
+						Target: id, Status: "critical", Detail: fmt.Sprintf("%d restarts in 5m", len(filtered)),
+					})
+					saveState()
+				}
+			}
+
 			if current.State == "running" {
 				if restartTracker[id] > 0 || alertState[id] != "" {
 					slog.Info("✨ Container healthy again — resetting trackers", "container", current.Name)
 					restartTracker[id] = 0
 					alertState[id] = ""
+					crashLoopTimes[id] = nil
 					saveState()
 				}
 			}
@@ -975,6 +1020,38 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 			}
 		}
 
+		// Memory pressure alerts — fire before OOMKill hits.
+		memPressureThreshold := 90.0
+		if v := os.Getenv("MEM_PRESSURE_THRESHOLD"); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+				memPressureThreshold = f
+			}
+		}
+		for _, s := range monitor.GetContainerStatSnapshot() {
+			if s.MemLimitMB <= 0 || s.MemPct < memPressureThreshold {
+				continue
+			}
+			key := "mem:" + s.Name
+			if shouldAlert(alertState[key], alertSentAt[key], alertCooldown) {
+				memMsg := fmt.Sprintf(
+					"🧠 **MEMORY PRESSURE!**\n\nContainer **%s** dah guna **%.1f%%** of its memory limit "+
+						"(%.0f / %.0f MB).\nKalau hit 100%% — OOMKilled. Kau kena scale up atau investigate sekarang!",
+					safeMD(s.Name), s.MemPct, s.MemUsedMB, s.MemLimitMB)
+				btnRCA := tgbotapi.NewInlineKeyboardButtonData("🔍 Investigate", "AnalyzeRCA:"+s.ID)
+				keyboard := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnRCA))
+				broadcaster.Broadcast(notify.Broadcast{Text: memMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard})
+				alertState[key] = "mem_pressure"
+				alertSentAt[key] = time.Now()
+				metrics.AlertsTotal.WithLabelValues("mem_pressure").Inc()
+				audit.Log(audit.Event{
+					Type: "alert", Actor: "system", Action: "mem_pressure",
+					Target: s.Name, Status: "warning",
+					Detail: fmt.Sprintf("%.1f%% of %.0fMB", s.MemPct, s.MemLimitMB),
+				})
+				saveState()
+			}
+		}
+
 		// Sustained CPU load alert
 		if monitor.GlobalMetricStore.CheckSustainedLoad(cpuThreshold, cpuDuration) {
 			alertMsg := fmt.Sprintf("🔥 **SUSTAINED HIGH LOAD ALERT!**\n\nCPU load kau dah lebih **%.0f%%** untuk %d minit berturut-turut bro! Server tengah berpeluh tu. 🥵\n\nNak aku check container mana yang makan resource paling banyak?", cpuThreshold, cpuDuration)
@@ -984,6 +1061,41 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 				Text: alertMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard,
 			})
 		}
+
+		// Log pattern scan — look for OOM, panic, FATAL, connection refused, etc.
+		// Bounded to 30s; results processed synchronously to avoid shared-map races.
+		func() {
+			scanCtx, scanCancel := context.WithTimeout(ctx, 30*time.Second)
+			defer scanCancel()
+			matches, err := monitor.ScanContainerLogs(scanCtx, 65*time.Second)
+			if err != nil {
+				slog.Warn("log pattern scan failed", "error", err)
+				return
+			}
+			for _, m := range matches {
+				key := "log:" + m.ContainerID + ":" + m.PatternName
+				if !shouldAlert(alertState[key], alertSentAt[key], alertCooldown) {
+					continue
+				}
+				emoji := "⚠️"
+				if m.Level == "critical" {
+					emoji = "🚨"
+				}
+				alertMsg := fmt.Sprintf(
+					"%s **LOG ALERT** — `%s` [**%s**]\n\n```\n%s\n```",
+					emoji, m.ContainerName, m.PatternName, m.MatchedLine)
+				btnRCA := tgbotapi.NewInlineKeyboardButtonData("🔍 RCA", "AnalyzeRCA:"+m.ContainerID)
+				keyboard := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnRCA))
+				broadcaster.Broadcast(notify.Broadcast{Text: alertMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard})
+				alertState[key] = "log_alert"
+				alertSentAt[key] = time.Now()
+				metrics.AlertsTotal.WithLabelValues("log_" + m.PatternName).Inc()
+				audit.Log(audit.Event{
+					Type: "alert", Actor: "system", Action: "log_pattern",
+					Target: m.ContainerName, Status: m.Level, Detail: m.PatternName,
+				})
+			}
+		}()
 
 		previousStates = currentStates
 	}
