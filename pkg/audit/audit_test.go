@@ -2,6 +2,7 @@ package audit
 
 import (
 	"bufio"
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -17,6 +18,7 @@ func resetForTest(t *testing.T, p string) {
 	path = p
 	maxSize = 10 * 1024 * 1024
 	maxFiles = 5
+	chainHash = "" // reset chain for each test
 	mu.Unlock()
 }
 
@@ -123,5 +125,63 @@ func TestSetPath_NoEmpty(t *testing.T) {
 	mu.Unlock()
 	if got != "audit.log" {
 		t.Errorf("SetPath(\"\") clobbered path to %q", got)
+	}
+}
+
+// TestVerify_IntactChain writes several events and asserts Verify() returns
+// Broken == -1 (no tamper detected).
+func TestVerify_IntactChain(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	resetForTest(t, logPath)
+
+	for i := 0; i < 5; i++ {
+		Log(Event{Type: "action", Actor: "system", Action: fmt.Sprintf("evt-%d", i), Status: "ok"})
+	}
+
+	result := Verify()
+	if result.Broken != -1 {
+		t.Errorf("intact chain should have Broken=-1, got %d: %s", result.Broken, result.ErrorMsg)
+	}
+	if result.Entries != 5 {
+		t.Errorf("expected 5 entries, got %d", result.Entries)
+	}
+}
+
+// TestVerify_DetectsTamper modifies one entry and asserts Verify() catches it.
+func TestVerify_DetectsTamper(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	resetForTest(t, logPath)
+
+	for i := 0; i < 3; i++ {
+		Log(Event{Type: "action", Actor: "system", Action: fmt.Sprintf("evt-%d", i), Status: "ok"})
+	}
+
+	// Read, tamper line 1, rewrite.
+	data, _ := os.ReadFile(logPath)
+	lines := strings.Split(strings.TrimRight(string(data), "\n"), "\n")
+	lines[1] = strings.Replace(lines[1], "evt-1", "TAMPERED", 1)
+	_ = os.WriteFile(logPath, []byte(strings.Join(lines, "\n")+"\n"), 0644)
+
+	result := Verify()
+	if result.Broken == -1 {
+		t.Error("tampered chain should have been detected")
+	}
+}
+
+// TestLog_HashFieldPopulated asserts every written entry has a non-empty Hash.
+func TestLog_HashFieldPopulated(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "audit.log")
+	resetForTest(t, logPath)
+
+	Log(Event{Type: "boot", Actor: "system", Status: "ok"})
+
+	data, _ := os.ReadFile(logPath)
+	var evt Event
+	_ = json.Unmarshal(bytes.TrimRight(data, "\n"), &evt)
+	if evt.Hash == "" {
+		t.Error("Log() should populate the Hash field")
 	}
 }

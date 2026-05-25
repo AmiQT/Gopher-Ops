@@ -59,6 +59,16 @@ func (s *MetricStore) PushMetrics(cpuLoad, ramLoad float64) {
 	}
 }
 
+// LatestPoint returns the most recent MetricPoint, or a zero value if the store is empty.
+func (s *MetricStore) LatestPoint() MetricPoint {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.Points) == 0 {
+		return MetricPoint{}
+	}
+	return s.Points[len(s.Points)-1]
+}
+
 // CheckSustainedLoad returns true if the average CPU over the last N points exceeds threshold.
 func (s *MetricStore) CheckSustainedLoad(threshold float64, count int) bool {
 	s.mu.RLock()
@@ -339,54 +349,5 @@ func GetVisualMetrics() (string, error) {
 	return sb.String(), nil
 }
 
-// GetImageSecurityReport performs a basic image-tag pattern check against a
-// small hardcoded list of known-vulnerable versions. This is NOT a real
-// CVE scan — it's a fallback that exists so the security-audit flow has
-// something to feed the AI when Trivy/Grype aren't installed.
-//
-// The output explicitly labels itself as a basic check so the AI (and the
-// operator reading the chat) can weight it appropriately. A real CVE
-// integration is on the upgrade roadmap.
-func GetImageSecurityReport() (string, error) {
-	cli, err := docker.Get()
-	if err != nil {
-		return "", fmt.Errorf("failed to get docker client: %w", err)
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
-	defer cancel()
-
-	containers, err := cli.ContainerList(ctx, container.ListOptions{All: true})
-	if err != nil {
-		return "", fmt.Errorf("failed to list containers: %w", err)
-	}
-
-	// Limited pattern-match database. NOT a substitute for a real CVE scanner.
-	knownVulnerable := map[string]string{
-		"nginx:1.18":  "CRITICAL: CVE-2021-23017 (Off-by-one in resolver). Upgrade to 1.21+",
-		"redis:5.0":   "HIGH: CVE-2022-24736 (Lua script vulnerability). Upgrade to 6.0+",
-		"postgres:10": "MEDIUM: Out of support. Upgrade to 13+",
-	}
-
-	var sb strings.Builder
-	sb.WriteString("VULNERABILITY SCAN REPORT (BASIC PATTERN CHECK):\n")
-	sb.WriteString("⚠️  Note: This is a limited pattern match against a hardcoded list of known issues.\n")
-	sb.WriteString("    For real CVE coverage, install Trivy or Grype and pipe results into this flow.\n\n")
-
-	foundCount := 0
-	for _, c := range containers {
-		for vulnImg, reason := range knownVulnerable {
-			if strings.Contains(c.Image, vulnImg) {
-				foundCount++
-				name := strings.TrimPrefix(c.Names[0], "/")
-				sb.WriteString(fmt.Sprintf("- ⚠️ **%s** (%s)\n  Status: %s\n", name, c.Image, reason))
-			}
-		}
-	}
-
-	if foundCount == 0 {
-		sb.WriteString("No matches against the pattern list. (Real CVEs may still exist — install a proper scanner.)\n")
-	}
-
-	return sb.String(), nil
-}
+// GetImageSecurityReport is now in trivy.go — it uses Trivy when available,
+// falling back to a hardcoded pattern list otherwise.

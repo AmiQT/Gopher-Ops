@@ -76,5 +76,49 @@ func ExtractIntents(output string) []ActionIntent {
 		intents = append(intents, ActionIntent{Action: "DiskUsage", Target: ""})
 	}
 
+	// UPDATE RESOURCES — UpdateResources('<id>', cpuCores, memMB)
+	updateRe := regexp.MustCompile(`UpdateResources\(['"]?([a-zA-Z0-9_-]+)['"]?`)
+	for _, matches := range updateRe.FindAllStringSubmatch(output, -1) {
+		if len(matches) > 1 {
+			intents = append(intents, ActionIntent{Action: "UpdateResources", Target: matches[1]})
+		}
+	}
+
+	// SEARCH LOGS — SearchLogs('<id>', 'pattern')
+	searchRe := regexp.MustCompile(`SearchLogs\(['"]?([a-zA-Z0-9_-]+)['"]?`)
+	for _, matches := range searchRe.FindAllStringSubmatch(output, -1) {
+		if len(matches) > 1 {
+			intents = append(intents, ActionIntent{Action: "SearchLogs", Target: matches[1]})
+		}
+	}
+
+	// KUBERNETES — K8sListPods(), K8sDescribePod('<pod>'), K8sRestartDeployment('<deploy>')
+	if regexp.MustCompile(`K8sListPods\(\)`).MatchString(output) {
+		intents = append(intents, ActionIntent{Action: "K8sListPods", Target: ""})
+	}
+	k8sPodRe := regexp.MustCompile(`K8sDescribePod\(['"]?([a-zA-Z0-9_/-]+)['"]?`)
+	for _, matches := range k8sPodRe.FindAllStringSubmatch(output, -1) {
+		if len(matches) > 1 {
+			intents = append(intents, ActionIntent{Action: "K8sDescribePod", Target: matches[1]})
+		}
+	}
+	k8sDeployRe := regexp.MustCompile(`K8sRestartDeployment\(['"]?([a-zA-Z0-9_/-]+)['"]?`)
+	for _, matches := range k8sDeployRe.FindAllStringSubmatch(output, -1) {
+		if len(matches) > 1 {
+			intents = append(intents, ActionIntent{Action: "K8sRestartDeployment", Target: matches[1]})
+		}
+	}
+
+	// CHAOS — ChaosKill('<name>') or ChaosKillRandom()
+	if regexp.MustCompile(`ChaosKillRandom\(\)`).MatchString(output) {
+		intents = append(intents, ActionIntent{Action: "ChaosKillRandom", Target: ""})
+	}
+	chaosRe := regexp.MustCompile(`ChaosKill\(['"]?([a-zA-Z0-9_/-]+)['"]?`)
+	for _, matches := range chaosRe.FindAllStringSubmatch(output, -1) {
+		if len(matches) > 1 {
+			intents = append(intents, ActionIntent{Action: "ChaosKill", Target: matches[1]})
+		}
+	}
+
 	return intents
 }

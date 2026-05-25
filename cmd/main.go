@@ -18,7 +18,10 @@ import (
 	"gopher-ops/pkg/actions"
 	"gopher-ops/pkg/ai"
 	"gopher-ops/pkg/audit"
+	"gopher-ops/pkg/chaos"
 	"gopher-ops/pkg/health"
+	"gopher-ops/pkg/k8s"
+	"gopher-ops/pkg/metrics"
 	"gopher-ops/pkg/monitor"
 	"gopher-ops/pkg/notify"
 	"gopher-ops/pkg/ratelimit"
@@ -69,6 +72,9 @@ func safeSend(bot *tgbotapi.BotAPI, msg tgbotapi.Chattable) (tgbotapi.Message, e
 	sent, err := bot.Send(msg)
 	if err != nil {
 		slog.Warn("telegram send failed", "error", err)
+		metrics.TelegramMsgTotal.WithLabelValues("error").Inc()
+	} else {
+		metrics.TelegramMsgTotal.WithLabelValues("ok").Inc()
 	}
 	return sent, err
 }
@@ -213,11 +219,13 @@ func main() {
 		}
 	}
 
-	agent, err := ai.NewAgent(aiCfg)
+	rawAgent, err := ai.NewAgent(aiCfg)
 	if err != nil {
 		slog.Error("Failed to initialize AI agent", "provider", llmProvider, "error", err)
 		os.Exit(1)
 	}
+	// Wrap with FallbackAgent so transient AI failures don't break the bot.
+	agent := ai.NewFallbackAgent(rawAgent)
 	defer agent.Close()
 
 	// 2. Initialize Telegram Bot
@@ -233,9 +241,26 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// 4. Optional /health HTTP endpoint
+	// 4. Register Prometheus metrics and start health+metrics HTTP server.
+	metrics.Register()
 	if port := os.Getenv("HEALTH_PORT"); port != "" {
-		health.New(port).Start(ctx)
+		srv := health.New(port, version)
+		// Docker daemon liveness probe
+		srv.AddProber("docker", func(ctx context.Context) health.SubsystemStatus {
+			_, err := monitor.GetContainerStates()
+			if err != nil {
+				return health.SubsystemStatus{OK: false, Message: err.Error()}
+			}
+			return health.SubsystemStatus{OK: true}
+		})
+		// Telegram reachability probe (uses cached bot.Self which is always set after init)
+		srv.AddProber("telegram", func(_ context.Context) health.SubsystemStatus {
+			if bot.Self.UserName == "" {
+				return health.SubsystemStatus{OK: false, Message: "bot not initialised"}
+			}
+			return health.SubsystemStatus{OK: true}
+		})
+		srv.Start(ctx)
 	}
 
 	// 5. Async Telegram broadcaster (fan-out to all authorized operators)
@@ -332,7 +357,21 @@ func main() {
 				case "start":
 					msgText = "🤖 **Gopher-Ops Ready!**\nSebut je apa kau nak aku buat kat server ni mat."
 				case "help":
-					msgText = "📖 **COMMANDS:**\n/start - Mula sembang\n/help - Tengok ni\n/status - Check bot & AI status\n/reset - Clear state"
+					msgText = "📖 **COMMANDS:**\n" +
+						"/start - Mula sembang\n" +
+						"/help - Tengok ni\n" +
+						"/status - Bot & AI status\n" +
+						"/containers - List semua Docker containers\n" +
+						"/metrics - Live host CPU/RAM stats\n" +
+						"/alerts - Active alert state\n" +
+						"/disk - Disk usage per mount\n" +
+						"/k8s - Kubernetes cluster info\n" +
+						"/chaos - Chaos test: kill random container (CHAOS\\_ENABLED=true required)\n" +
+						"/reset - Clear in-memory state\n\n" +
+						"**Inline commands:**\n" +
+						"`update <ctr> cpu <cores> mem <mb>` - Adjust resources\n" +
+						"`search <ctr> <pattern>` - Grep container logs\n" +
+						"`chaos kill <name>` - Kill specific container (chaos mode)"
 				case "status":
 					health, _ := monitor.GetSystemHealth()
 					provider := os.Getenv("LLM_PROVIDER")
@@ -341,13 +380,108 @@ func main() {
 					if os.Getenv("AUTOPILOT_ENABLED") == "true" {
 						autoPilot = "ACTIVE ✅ (Self-Healing On)"
 					}
+					aiStatus := "ONLINE ✅"
+					if agent.IsOffline() {
+						aiStatus = "OFFLINE ⚠️ (fallback mode)"
+					}
 					msgText = fmt.Sprintf("🤖 **GOPHER-OPS STATUS**\n\n"+
 						"🔖 **Version:** %s\n"+
-						"🧠 **AI Engine:** %s (%s)\n"+
+						"🧠 **AI Engine:** %s (%s) — %s\n"+
 						"🤖 **Autopilot:** %s\n"+
 						"👥 **Operators:** %d configured\n\n"+
 						"📊 **Live Metrics:**\n%s",
-						version, strings.ToUpper(provider), model, autoPilot, len(authorizedIDs), health)
+						version, strings.ToUpper(provider), model, aiStatus, autoPilot, len(authorizedIDs), health)
+				case "containers":
+					states, err := monitor.GetContainerStates()
+					if err != nil {
+						msgText = fmt.Sprintf("❌ Tak dapat list containers: %v", err)
+					} else if len(states) == 0 {
+						msgText = "_(tiada containers)_"
+					} else {
+						var sb strings.Builder
+						sb.WriteString("🐳 **CONTAINERS**\n\n")
+						for id, cs := range states {
+							emoji := "🟢"
+							if cs.State != "running" {
+								emoji = "🔴"
+							}
+							sb.WriteString(fmt.Sprintf("%s `%s` — **%s** (%s)\n", emoji, id, cs.Name, cs.State))
+						}
+						msgText = sb.String()
+					}
+				case "metrics":
+					if last := monitor.GlobalMetricStore.LatestPoint(); !last.Timestamp.IsZero() {
+						stats := monitor.GetContainerStatSnapshot()
+						var sb strings.Builder
+						sb.WriteString("📊 **LIVE METRICS**\n\n")
+						sb.WriteString(fmt.Sprintf("🖥️  Host CPU: **%.1f%%**\n", last.CPU))
+						sb.WriteString(fmt.Sprintf("💾  Host RAM: **%.1f%%**\n\n", last.RAM))
+						if len(stats) > 0 {
+							sb.WriteString("**Per Container:**\n")
+							for _, s := range stats {
+								sb.WriteString(fmt.Sprintf("  • **%s** CPU %.1f%% | RAM %.1f%%\n", s.Name, s.CPUPct, s.MemPct))
+							}
+						}
+						msgText = sb.String()
+					} else {
+						msgText = "_(metrics belum collected lagi — tunggu ~60s)_"
+					}
+				case "alerts":
+					// Expose active alert state by reading state.json
+					data, err := os.ReadFile(stateFile)
+					if err != nil {
+						msgText = "_(tiada state aktif atau state.json tidak wujud)_"
+					} else {
+						var state struct {
+							Alerts      map[string]string    `json:"alerts"`
+							AlertSentAt map[string]time.Time `json:"alert_sent_at"`
+						}
+						if err := json.Unmarshal(data, &state); err != nil || len(state.Alerts) == 0 {
+							msgText = "✅ Tiada active alerts sekarang."
+						} else {
+							var sb strings.Builder
+							sb.WriteString("🚨 **ACTIVE ALERTS**\n\n")
+							for id, status := range state.Alerts {
+								when := state.AlertSentAt[id].Format("15:04:05")
+								sb.WriteString(fmt.Sprintf("• `%s` → **%s** (since %s)\n", id, status, when))
+							}
+							msgText = sb.String()
+						}
+					}
+				case "disk":
+					msgText = monitor.FormatDiskUsage()
+				case "k8s":
+					if !k8s.Available() {
+						msgText = "⚠️ kubectl not found on PATH — install kubectl to use Kubernetes features.\n\nFor now, Kubernetes ops are available via MCP (mcp-server-kubernetes)."
+					} else {
+						info, err := k8s.GetClusterInfo()
+						if err != nil {
+							msgText = fmt.Sprintf("❌ k8s error: %v", err)
+						} else {
+							msgText = "☸️ **KUBERNETES CLUSTER**\n\n" + info
+						}
+					}
+				case "chaos":
+					if !chaos.Enabled() {
+						msgText = "⚠️ **Chaos mode disabled.**\nSet `CHAOS_ENABLED=true` in your .env to enable fault injection.\n\n_Gunakan dengan berhati-hati — ini akan stop container secara rawak!_"
+					} else {
+						ctx10 := context.Background()
+						result, err := chaos.KillRandom(ctx10)
+						if err != nil {
+							msgText = fmt.Sprintf("❌ Chaos kill failed: %v", err)
+						} else {
+							audit.Log(audit.Event{
+								Type:   "action",
+								Actor:  "user",
+								Action: "ChaosKill",
+								Target: result.ContainerName,
+								Status: "ok",
+								Detail: "random kill via /chaos command",
+							})
+							metrics.AlertsTotal.WithLabelValues("chaos_kill").Inc()
+							msgText = chaos.FormatResult(result)
+						}
+					}
 				case "reset":
 					os.Remove(stateFile)
 					select {
@@ -372,6 +506,88 @@ func main() {
 				msg.ParseMode = "Markdown"
 				safeSend(bot, msg)
 				continue
+			}
+
+			// "update <container> cpu <cores> mem <mb>" — adjust resources inline.
+			// Example: update nginx cpu 0.5 mem 512
+			if strings.HasPrefix(strings.ToLower(input), "update ") {
+				parts := strings.Fields(input)
+				if len(parts) >= 6 {
+					ctrID := parts[1]
+					var cpuCores float64
+					var memMB int64
+					for i := 2; i+1 < len(parts); i++ {
+						switch strings.ToLower(parts[i]) {
+						case "cpu":
+							cpuCores, _ = strconv.ParseFloat(parts[i+1], 64)
+						case "mem", "memory":
+							memMB, _ = strconv.ParseInt(parts[i+1], 10, 64)
+						}
+					}
+					result, err := actions.UpdateContainerResources(ctrID, cpuCores, memMB)
+					var txt string
+					if err != nil {
+						txt = fmt.Sprintf("❌ Update failed: %v", err)
+					} else {
+						audit.Log(audit.Event{Type: "action", Actor: "user", Action: "update_resources", Target: ctrID, Status: "ok"})
+						txt = result
+					}
+					msg := tgbotapi.NewMessage(update.Message.Chat.ID, txt)
+					safeSend(bot, msg)
+					continue
+				}
+			}
+
+			// "search <container> <pattern>" — grep logs inline.
+			// Example: search nginx error
+			if strings.HasPrefix(strings.ToLower(input), "search ") {
+				parts := strings.SplitN(input, " ", 3)
+				if len(parts) == 3 {
+					ctrID, pattern := parts[1], parts[2]
+					result, err := actions.SearchLogs(ctrID, pattern, 500, 20)
+					var txt string
+					if err != nil {
+						txt = fmt.Sprintf("❌ Search failed: %v", err)
+					} else {
+						txt = result
+					}
+					msg := tgbotapi.NewMessage(update.Message.Chat.ID, txt)
+					msg.ParseMode = "Markdown"
+					safeSend(bot, msg)
+					continue
+				}
+			}
+
+			// "chaos kill <name>" — targeted chaos injection.
+			if strings.HasPrefix(strings.ToLower(input), "chaos kill ") {
+				parts := strings.SplitN(input, " ", 3)
+				if len(parts) == 3 {
+					targetName := parts[2]
+					var txt string
+					if !chaos.Enabled() {
+						txt = "⚠️ Chaos mode disabled — set CHAOS_ENABLED=true to use chaos injection."
+					} else {
+						result, err := chaos.KillNamed(context.Background(), targetName)
+						if err != nil {
+							txt = fmt.Sprintf("❌ Chaos kill failed: %v", err)
+						} else {
+							audit.Log(audit.Event{
+								Type:   "action",
+								Actor:  "user",
+								Action: "ChaosKill",
+								Target: result.ContainerName,
+								Status: "ok",
+								Detail: "named kill via chaos kill inline command",
+							})
+							metrics.AlertsTotal.WithLabelValues("chaos_kill").Inc()
+							txt = chaos.FormatResult(result)
+						}
+					}
+					msg := tgbotapi.NewMessage(update.Message.Chat.ID, txt)
+					msg.ParseMode = "Markdown"
+					safeSend(bot, msg)
+					continue
+				}
 			}
 
 			msgLoader := tgbotapi.NewMessage(update.Message.Chat.ID, "🧠 Gopher-Ops is thinking...")
@@ -427,6 +643,20 @@ func main() {
 						btnText = "📦 Live Container Stats"
 					case "DiskUsage":
 						btnText = "💾 Show Disk Usage"
+					case "UpdateResources":
+						btnText = "⚙️ Update Resources " + targetName
+					case "SearchLogs":
+						btnText = "🔎 Search Logs " + targetName
+					case "K8sListPods":
+						btnText = "☸️ List Pods"
+					case "K8sDescribePod":
+						btnText = "☸️ Describe Pod " + targetName
+					case "K8sRestartDeployment":
+						btnText = "☸️ Restart Deployment " + targetName
+					case "ChaosKillRandom":
+						btnText = "💥 Chaos: Kill Random Container"
+					case "ChaosKill":
+						btnText = "💥 Chaos Kill " + targetName
 					case "InvestigateNetwork":
 						btnText = "🌐 Triage: Network " + targetName
 					case "CheckConfig":
@@ -517,6 +747,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ Aduh, AI pening nak analyze: %v", err)
 		} else {
+			metrics.RCATotal.Inc()
 			resMsg = fmt.Sprintf("🧐 **ANALISIS RCA: %s**\n\n%s", safeMD(name), analysis)
 		}
 	case "TerraformApply":
@@ -575,6 +806,61 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		resMsg = monitor.FormatContainerStats()
 	case "DiskUsage":
 		resMsg = monitor.FormatDiskUsage()
+	case "UpdateResources":
+		// Callback data format: "UpdateResources:<id>:<cpuCores>:<memMB>"
+		// When triggered from a button, parts may be encoded in the target field.
+		// For now surface a prompt — actual values come from AI intent or follow-up.
+		resMsg = fmt.Sprintf("⚙️ **Update Resources: `%s`**\n\nHantar arahan dalam format:\n`update <container> cpu <cores> mem <mb>`\n\nContoh: `update nginx cpu 0.5 mem 512`", safeMD(target))
+	case "SearchLogs":
+		resMsg = fmt.Sprintf("🔎 **Search Logs: `%s`**\n\nHantar pattern yang nak cari:\n`search <container> <pattern>`\n\nContoh: `search nginx error`", safeMD(target))
+	case "K8sListPods":
+		out, err := k8s.ListPods("")
+		if err != nil {
+			resMsg = fmt.Sprintf("❌ k8s error: %v", err)
+		} else {
+			resMsg = "☸️ **PODS**\n\n" + out
+		}
+	case "K8sDescribePod":
+		out, err := k8s.DescribePod("", target)
+		if err != nil {
+			resMsg = fmt.Sprintf("❌ k8s error: %v", err)
+		} else {
+			resMsg = out
+		}
+	case "K8sRestartDeployment":
+		out, err := k8s.RestartDeployment("", target)
+		if err != nil {
+			resMsg = fmt.Sprintf("❌ k8s error: %v", err)
+		} else {
+			auditAction("K8sRestartDeployment", target, nil)
+			resMsg = out
+		}
+	case "ChaosKillRandom":
+		if !chaos.Enabled() {
+			resMsg = "⚠️ Chaos mode disabled — set CHAOS_ENABLED=true to enable."
+		} else {
+			result, err := chaos.KillRandom(context.Background())
+			auditAction("ChaosKill", "random", err)
+			if err != nil {
+				resMsg = fmt.Sprintf("❌ Chaos kill failed: %v", err)
+			} else {
+				metrics.AlertsTotal.WithLabelValues("chaos_kill").Inc()
+				resMsg = chaos.FormatResult(result)
+			}
+		}
+	case "ChaosKill":
+		if !chaos.Enabled() {
+			resMsg = "⚠️ Chaos mode disabled — set CHAOS_ENABLED=true to enable."
+		} else {
+			result, err := chaos.KillNamed(context.Background(), target)
+			auditAction("ChaosKill", target, err)
+			if err != nil {
+				resMsg = fmt.Sprintf("❌ Chaos kill failed: %v", err)
+			} else {
+				metrics.AlertsTotal.WithLabelValues("chaos_kill").Inc()
+				resMsg = chaos.FormatResult(result)
+			}
+		}
 	default:
 		resMsg = "Action tak jumpa wtf ahaha"
 	}
@@ -640,6 +926,10 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 	restartTracker := make(map[string]int)
 	alertState := make(map[string]string)
 	alertSentAt := make(map[string]time.Time)
+	// crashLoopTimes tracks the timestamps of recent restarts per container so
+	// we can detect a crash-loop (N restarts within a time window) independently
+	// of the lifetime restart counter used by autopilot.
+	crashLoopTimes := make(map[string][]time.Time)
 
 	var mu sync.Mutex
 	saveState := func() {
@@ -701,6 +991,7 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 			restartTracker = make(map[string]int)
 			alertState = make(map[string]string)
 			alertSentAt = make(map[string]time.Time)
+			crashLoopTimes = make(map[string][]time.Time)
 			for k := range rcaCache {
 				delete(rcaCache, k)
 			}
@@ -709,12 +1000,41 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 		case <-ticker.C:
 		}
 
-		// Collect per-container CPU/RAM in the background; errors are non-fatal.
+		// Collect per-container stats then push all values to Prometheus.
 		go func() {
 			collectCtx, collectCancel := context.WithTimeout(ctx, 30*time.Second)
 			defer collectCancel()
 			if err := monitor.CollectContainerStats(collectCtx); err != nil {
 				slog.Warn("container stats collection failed", "error", err)
+				return
+			}
+			for _, s := range monitor.GetContainerStatSnapshot() {
+				metrics.ContainerCPUPct.WithLabelValues(s.Name).Set(s.CPUPct)
+				metrics.ContainerRAMUsedMB.WithLabelValues(s.Name).Set(s.MemUsedMB)
+				metrics.ContainerRAMPct.WithLabelValues(s.Name).Set(s.MemPct)
+				metrics.ContainerNetRxMB.WithLabelValues(s.Name).Set(s.NetRxMB)
+				metrics.ContainerNetTxMB.WithLabelValues(s.Name).Set(s.NetTxMB)
+				metrics.ContainerBlkReadMB.WithLabelValues(s.Name).Set(s.BlkReadMB)
+				metrics.ContainerBlkWriteMB.WithLabelValues(s.Name).Set(s.BlkWriteMB)
+				metrics.ContainerPIDs.WithLabelValues(s.Name).Set(float64(s.PIDs))
+				up := 0.0
+				if s.State == "running" {
+					up = 1.0
+				}
+				metrics.ContainerUp.WithLabelValues(s.Name).Set(up)
+			}
+			// Push host-level figures
+			if last := monitor.GlobalMetricStore.LatestPoint(); !last.Timestamp.IsZero() {
+				metrics.HostCPUPct.Set(last.CPU)
+				metrics.HostRAMPct.Set(last.RAM)
+			}
+			// Push disk figures
+			if usages, err := monitor.GetDiskUsage(); err == nil {
+				for _, u := range usages {
+					metrics.DiskUsedPct.WithLabelValues(u.Mount, u.Filesystem).Set(u.UsedPct)
+					metrics.DiskUsedGB.WithLabelValues(u.Mount, u.Filesystem).Set(u.UsedGB)
+					metrics.DiskTotalGB.WithLabelValues(u.Mount, u.Filesystem).Set(u.TotalGB)
+				}
 			}
 		}()
 
@@ -794,6 +1114,7 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 					}
 					alertState[id] = "alert_sent"
 					alertSentAt[id] = time.Now()
+					metrics.AlertsTotal.WithLabelValues("container_down").Inc()
 					audit.Log(audit.Event{
 						Type: "alert", Actor: "system", Action: "container_down",
 						Target: id, Status: "info", Detail: current.Name,
@@ -812,11 +1133,51 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 				}
 			}
 
+			// Crash-loop detection: record each restart timestamp and alert
+			// when 3+ restarts happen within a 5-minute window. This fires
+			// independently of the autopilot counter so it works even when
+			// AUTOPILOT_ENABLED=false.
+			if exists && prev.State == "running" && current.State != "running" {
+				now := time.Now()
+				window := 5 * time.Minute
+				times := crashLoopTimes[id]
+				// Prune entries outside the window.
+				cutoff := now.Add(-window)
+				filtered := times[:0]
+				for _, t := range times {
+					if t.After(cutoff) {
+						filtered = append(filtered, t)
+					}
+				}
+				filtered = append(filtered, now)
+				crashLoopTimes[id] = filtered
+
+				if len(filtered) >= 3 && alertState[id] != "crashloop" {
+					loopMsg := fmt.Sprintf(
+						"🔴 **CRASH LOOP DETECTED!**\n\nContainer **%s** dah restart **%d kali dalam 5 minit**. "+
+							"Ini bukan fluke — ada root cause serius. Kau kena check sekarang!\n\n"+
+							"Nak aku buat RCA?",
+						safeMD(current.Name), len(filtered))
+					btnRCA := tgbotapi.NewInlineKeyboardButtonData("🔍 Deep RCA", "AnalyzeRCA:"+id)
+					keyboard := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnRCA))
+					broadcaster.Broadcast(notify.Broadcast{Text: loopMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard})
+					alertState[id] = "crashloop"
+					alertSentAt[id] = now
+					metrics.AlertsTotal.WithLabelValues("crash_loop").Inc()
+					audit.Log(audit.Event{
+						Type: "alert", Actor: "system", Action: "crash_loop",
+						Target: id, Status: "critical", Detail: fmt.Sprintf("%d restarts in 5m", len(filtered)),
+					})
+					saveState()
+				}
+			}
+
 			if current.State == "running" {
 				if restartTracker[id] > 0 || alertState[id] != "" {
 					slog.Info("✨ Container healthy again — resetting trackers", "container", current.Name)
 					restartTracker[id] = 0
 					alertState[id] = ""
+					crashLoopTimes[id] = nil
 					saveState()
 				}
 			}
@@ -850,8 +1211,41 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 					broadcaster.Broadcast(notify.Broadcast{Text: alertMsg, ParseMode: "Markdown"})
 					alertState[key] = "high"
 					alertSentAt[key] = time.Now()
+					metrics.AlertsTotal.WithLabelValues("disk_high").Inc()
 					audit.Log(audit.Event{Type: "alert", Actor: "system", Action: "disk_high", Target: a.Mount, Status: "fired"})
 				}
+			}
+		}
+
+		// Memory pressure alerts — fire before OOMKill hits.
+		memPressureThreshold := 90.0
+		if v := os.Getenv("MEM_PRESSURE_THRESHOLD"); v != "" {
+			if f, err := strconv.ParseFloat(v, 64); err == nil && f > 0 {
+				memPressureThreshold = f
+			}
+		}
+		for _, s := range monitor.GetContainerStatSnapshot() {
+			if s.MemLimitMB <= 0 || s.MemPct < memPressureThreshold {
+				continue
+			}
+			key := "mem:" + s.Name
+			if shouldAlert(alertState[key], alertSentAt[key], alertCooldown) {
+				memMsg := fmt.Sprintf(
+					"🧠 **MEMORY PRESSURE!**\n\nContainer **%s** dah guna **%.1f%%** of its memory limit "+
+						"(%.0f / %.0f MB).\nKalau hit 100%% — OOMKilled. Kau kena scale up atau investigate sekarang!",
+					safeMD(s.Name), s.MemPct, s.MemUsedMB, s.MemLimitMB)
+				btnRCA := tgbotapi.NewInlineKeyboardButtonData("🔍 Investigate", "AnalyzeRCA:"+s.ID)
+				keyboard := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnRCA))
+				broadcaster.Broadcast(notify.Broadcast{Text: memMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard})
+				alertState[key] = "mem_pressure"
+				alertSentAt[key] = time.Now()
+				metrics.AlertsTotal.WithLabelValues("mem_pressure").Inc()
+				audit.Log(audit.Event{
+					Type: "alert", Actor: "system", Action: "mem_pressure",
+					Target: s.Name, Status: "warning",
+					Detail: fmt.Sprintf("%.1f%% of %.0fMB", s.MemPct, s.MemLimitMB),
+				})
+				saveState()
 			}
 		}
 
@@ -864,6 +1258,41 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 				Text: alertMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard,
 			})
 		}
+
+		// Log pattern scan — look for OOM, panic, FATAL, connection refused, etc.
+		// Bounded to 30s; results processed synchronously to avoid shared-map races.
+		func() {
+			scanCtx, scanCancel := context.WithTimeout(ctx, 30*time.Second)
+			defer scanCancel()
+			matches, err := monitor.ScanContainerLogs(scanCtx, 65*time.Second)
+			if err != nil {
+				slog.Warn("log pattern scan failed", "error", err)
+				return
+			}
+			for _, m := range matches {
+				key := "log:" + m.ContainerID + ":" + m.PatternName
+				if !shouldAlert(alertState[key], alertSentAt[key], alertCooldown) {
+					continue
+				}
+				emoji := "⚠️"
+				if m.Level == "critical" {
+					emoji = "🚨"
+				}
+				alertMsg := fmt.Sprintf(
+					"%s **LOG ALERT** — `%s` [**%s**]\n\n```\n%s\n```",
+					emoji, m.ContainerName, m.PatternName, m.MatchedLine)
+				btnRCA := tgbotapi.NewInlineKeyboardButtonData("🔍 RCA", "AnalyzeRCA:"+m.ContainerID)
+				keyboard := tgbotapi.NewInlineKeyboardMarkup(tgbotapi.NewInlineKeyboardRow(btnRCA))
+				broadcaster.Broadcast(notify.Broadcast{Text: alertMsg, ParseMode: "Markdown", ReplyMarkup: &keyboard})
+				alertState[key] = "log_alert"
+				alertSentAt[key] = time.Now()
+				metrics.AlertsTotal.WithLabelValues("log_" + m.PatternName).Inc()
+				audit.Log(audit.Event{
+					Type: "alert", Actor: "system", Action: "log_pattern",
+					Target: m.ContainerName, Status: m.Level, Detail: m.PatternName,
+				})
+			}
+		}()
 
 		previousStates = currentStates
 	}
