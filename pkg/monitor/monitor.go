@@ -248,7 +248,29 @@ func GetSecurityContext() (string, error) {
 	return sb.String(), nil
 }
 
-// GetVisualMetrics returns an ASCII bar chart of container states.
+// asciiBar builds a 20-char ASCII progress bar for the given percentage.
+func asciiBar(pct float64) string {
+	if pct < 0 {
+		pct = 0
+	}
+	if pct > 100 {
+		pct = 100
+	}
+	filled := int(pct / 5) // 20 chars → each char = 5 %
+	bar := make([]byte, 20)
+	for i := range bar {
+		if i < filled {
+			bar[i] = '|'
+		} else {
+			bar[i] = ' '
+		}
+	}
+	return string(bar)
+}
+
+// GetVisualMetrics returns an ASCII bar chart of container states alongside
+// real host CPU/RAM taken from GlobalMetricStore. Per-container CPU is not
+// available from ContainerList; the host-level figures are shown instead.
 func GetVisualMetrics() (string, error) {
 	cli, err := docker.Get()
 	if err != nil {
@@ -263,26 +285,43 @@ func GetVisualMetrics() (string, error) {
 		return "", fmt.Errorf("failed to list containers: %w", err)
 	}
 
+	// Grab the most recent metric point for host CPU/RAM.
+	GlobalMetricStore.mu.RLock()
+	var latestCPU, latestRAM float64
+	if n := len(GlobalMetricStore.Points); n > 0 {
+		latestCPU = GlobalMetricStore.Points[n-1].CPU
+		latestRAM = GlobalMetricStore.Points[n-1].RAM
+	}
+	GlobalMetricStore.mu.RUnlock()
+
 	var sb strings.Builder
 	sb.WriteString("📊 **SYSTEM PULSE (ASCII)**\n\n")
 
+	running, stopped := 0, 0
 	for _, c := range containers {
 		name := strings.TrimPrefix(c.Names[0], "/")
 		if len(name) > 15 {
 			name = name[:12] + "..."
 		}
-
-		stateEmoji := "🟢"
-		if c.State != "running" {
-			stateEmoji = "🔴"
-		}
-
-		sb.WriteString(fmt.Sprintf("%s **%-15s**\n", stateEmoji, name))
 		if c.State == "running" {
-			sb.WriteString("`[||||||||||          ] 50%` (Estimated)\n")
+			running++
+			sb.WriteString(fmt.Sprintf("🟢 **%-15s** (%s)\n", name, c.Status))
 		} else {
-			sb.WriteString("`[                    ] 0%` (Offline)\n")
+			stopped++
+			sb.WriteString(fmt.Sprintf("🔴 **%-15s** (%s)\n", name, c.Status))
 		}
+	}
+
+	sb.WriteString(fmt.Sprintf("\n🖥️  Containers: %d running, %d stopped\n\n", running, stopped))
+
+	sb.WriteString("**Host CPU (system-wide):**\n")
+	sb.WriteString(fmt.Sprintf("`[%-20s]` %.1f%%\n\n", asciiBar(latestCPU), latestCPU))
+
+	sb.WriteString("**Host RAM:**\n")
+	sb.WriteString(fmt.Sprintf("`[%-20s]` %.1f%%\n", asciiBar(latestRAM), latestRAM))
+
+	if latestCPU == 0 && latestRAM == 0 {
+		sb.WriteString("\n_(metrics not yet collected — check again in ~60 s)_\n")
 	}
 
 	return sb.String(), nil

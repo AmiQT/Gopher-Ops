@@ -16,10 +16,10 @@
 - **Telemetry & Observability:** Real-time monitoring of host OS (CPU/RAM), Docker, and Kubernetes states via **gopsutil**, **Docker SDK**, and **MCP**. Includes a 1-hour in-memory metric history for sustained high-load detection and proactive alerting.
 - **Guided Triage & HITL Execution:** Parses AI suggestions into clickable Telegram buttons for safe actions (Start/Stop/Restart) and interactive troubleshooting flows (Network triage & Configuration validation).
 - **Infrastructure as Code (IaC):** **Terraform** provisions a local microservices lab environment (Nginx, scalable/stateful Redis cluster, custom networks, and persistent volumes).
-- **Sec & Ops:** Zero-Trust ID gating via Telegram; Automated Docker image vulnerability scanning; and a robust **GitHub Actions** CI/CD pipeline for Go tests and Terraform validation.
+- **Sec & Ops:** Zero-Trust ID gating via Telegram; Basic Docker image vulnerability pattern-matching (install Trivy/Grype for full CVE coverage); and a robust **GitHub Actions** CI/CD pipeline for Go tests and Terraform validation.
 - **Kubernetes & MCP Support:** Seamlessly manages cluster operations using the **Model Context Protocol (MCP)**, bridging AI with Kubernetes native tools.
 - **Robust CI/CD Pipeline:** Configured with **GitHub Actions** for automated Go unit testing and Terraform validation/formatting upon every push/PR.
-- **Zero-Trust & DevSecOps:** Hardcoded Telegram Chat ID gating ensuring only the authorized operator can execute commands. Includes **automated image vulnerability scanning** for outdated Docker tags/CVEs.
+- **Zero-Trust & DevSecOps:** Telegram Chat ID gating (supports multiple authorized operators) ensuring only authorized operators can execute commands. Includes **basic image vulnerability pattern-matching** against known-bad tags — integrate Trivy or Grype for real CVE coverage.
 
 ## 🎮 Interactive Demo
 
