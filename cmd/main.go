@@ -353,7 +353,15 @@ func main() {
 				case "start":
 					msgText = "🤖 **Gopher-Ops Ready!**\nSebut je apa kau nak aku buat kat server ni mat."
 				case "help":
-					msgText = "📖 **COMMANDS:**\n/start - Mula sembang\n/help - Tengok ni\n/status - Check bot & AI status\n/reset - Clear state"
+					msgText = "📖 **COMMANDS:**\n" +
+						"/start - Mula sembang\n" +
+						"/help - Tengok ni\n" +
+						"/status - Bot & AI status\n" +
+						"/containers - List semua containers\n" +
+						"/metrics - Live host CPU/RAM stats\n" +
+						"/alerts - Active alert state\n" +
+						"/disk - Disk usage per mount\n" +
+						"/reset - Clear in-memory state"
 				case "status":
 					health, _ := monitor.GetSystemHealth()
 					provider := os.Getenv("LLM_PROVIDER")
@@ -369,6 +377,65 @@ func main() {
 						"👥 **Operators:** %d configured\n\n"+
 						"📊 **Live Metrics:**\n%s",
 						version, strings.ToUpper(provider), model, autoPilot, len(authorizedIDs), health)
+				case "containers":
+					states, err := monitor.GetContainerStates()
+					if err != nil {
+						msgText = fmt.Sprintf("❌ Tak dapat list containers: %v", err)
+					} else if len(states) == 0 {
+						msgText = "_(tiada containers)_"
+					} else {
+						var sb strings.Builder
+						sb.WriteString("🐳 **CONTAINERS**\n\n")
+						for id, cs := range states {
+							emoji := "🟢"
+							if cs.State != "running" {
+								emoji = "🔴"
+							}
+							sb.WriteString(fmt.Sprintf("%s `%s` — **%s** (%s)\n", emoji, id, cs.Name, cs.State))
+						}
+						msgText = sb.String()
+					}
+				case "metrics":
+					if last := monitor.GlobalMetricStore.LatestPoint(); !last.Timestamp.IsZero() {
+						stats := monitor.GetContainerStatSnapshot()
+						var sb strings.Builder
+						sb.WriteString("📊 **LIVE METRICS**\n\n")
+						sb.WriteString(fmt.Sprintf("🖥️  Host CPU: **%.1f%%**\n", last.CPU))
+						sb.WriteString(fmt.Sprintf("💾  Host RAM: **%.1f%%**\n\n", last.RAM))
+						if len(stats) > 0 {
+							sb.WriteString("**Per Container:**\n")
+							for _, s := range stats {
+								sb.WriteString(fmt.Sprintf("  • **%s** CPU %.1f%% | RAM %.1f%%\n", s.Name, s.CPUPct, s.MemPct))
+							}
+						}
+						msgText = sb.String()
+					} else {
+						msgText = "_(metrics belum collected lagi — tunggu ~60s)_"
+					}
+				case "alerts":
+					// Expose active alert state by reading state.json
+					data, err := os.ReadFile(stateFile)
+					if err != nil {
+						msgText = "_(tiada state aktif atau state.json tidak wujud)_"
+					} else {
+						var state struct {
+							Alerts      map[string]string    `json:"alerts"`
+							AlertSentAt map[string]time.Time `json:"alert_sent_at"`
+						}
+						if err := json.Unmarshal(data, &state); err != nil || len(state.Alerts) == 0 {
+							msgText = "✅ Tiada active alerts sekarang."
+						} else {
+							var sb strings.Builder
+							sb.WriteString("🚨 **ACTIVE ALERTS**\n\n")
+							for id, status := range state.Alerts {
+								when := state.AlertSentAt[id].Format("15:04:05")
+								sb.WriteString(fmt.Sprintf("• `%s` → **%s** (since %s)\n", id, status, when))
+							}
+							msgText = sb.String()
+						}
+					}
+				case "disk":
+					msgText = monitor.FormatDiskUsage()
 				case "reset":
 					os.Remove(stateFile)
 					select {
