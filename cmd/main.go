@@ -218,11 +218,13 @@ func main() {
 		}
 	}
 
-	agent, err := ai.NewAgent(aiCfg)
+	rawAgent, err := ai.NewAgent(aiCfg)
 	if err != nil {
 		slog.Error("Failed to initialize AI agent", "provider", llmProvider, "error", err)
 		os.Exit(1)
 	}
+	// Wrap with FallbackAgent so transient AI failures don't break the bot.
+	agent := ai.NewFallbackAgent(rawAgent)
 	defer agent.Close()
 
 	// 2. Initialize Telegram Bot
@@ -375,13 +377,17 @@ func main() {
 					if os.Getenv("AUTOPILOT_ENABLED") == "true" {
 						autoPilot = "ACTIVE ✅ (Self-Healing On)"
 					}
+					aiStatus := "ONLINE ✅"
+					if agent.IsOffline() {
+						aiStatus = "OFFLINE ⚠️ (fallback mode)"
+					}
 					msgText = fmt.Sprintf("🤖 **GOPHER-OPS STATUS**\n\n"+
 						"🔖 **Version:** %s\n"+
-						"🧠 **AI Engine:** %s (%s)\n"+
+						"🧠 **AI Engine:** %s (%s) — %s\n"+
 						"🤖 **Autopilot:** %s\n"+
 						"👥 **Operators:** %d configured\n\n"+
 						"📊 **Live Metrics:**\n%s",
-						version, strings.ToUpper(provider), model, autoPilot, len(authorizedIDs), health)
+						version, strings.ToUpper(provider), model, aiStatus, autoPilot, len(authorizedIDs), health)
 				case "containers":
 					states, err := monitor.GetContainerStates()
 					if err != nil {
