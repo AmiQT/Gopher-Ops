@@ -109,5 +109,16 @@ func ExtractIntents(output string) []ActionIntent {
 		}
 	}
 
+	// CHAOS — ChaosKill('<name>') or ChaosKillRandom()
+	if regexp.MustCompile(`ChaosKillRandom\(\)`).MatchString(output) {
+		intents = append(intents, ActionIntent{Action: "ChaosKillRandom", Target: ""})
+	}
+	chaosRe := regexp.MustCompile(`ChaosKill\(['"]?([a-zA-Z0-9_/-]+)['"]?`)
+	for _, matches := range chaosRe.FindAllStringSubmatch(output, -1) {
+		if len(matches) > 1 {
+			intents = append(intents, ActionIntent{Action: "ChaosKill", Target: matches[1]})
+		}
+	}
+
 	return intents
 }

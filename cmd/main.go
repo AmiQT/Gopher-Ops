@@ -18,6 +18,7 @@ import (
 	"gopher-ops/pkg/actions"
 	"gopher-ops/pkg/ai"
 	"gopher-ops/pkg/audit"
+	"gopher-ops/pkg/chaos"
 	"gopher-ops/pkg/health"
 	"gopher-ops/pkg/k8s"
 	"gopher-ops/pkg/metrics"
@@ -365,10 +366,12 @@ func main() {
 						"/alerts - Active alert state\n" +
 						"/disk - Disk usage per mount\n" +
 						"/k8s - Kubernetes cluster info\n" +
+						"/chaos - Chaos test: kill random container (CHAOS\\_ENABLED=true required)\n" +
 						"/reset - Clear in-memory state\n\n" +
 						"**Inline commands:**\n" +
 						"`update <ctr> cpu <cores> mem <mb>` - Adjust resources\n" +
-						"`search <ctr> <pattern>` - Grep container logs"
+						"`search <ctr> <pattern>` - Grep container logs\n" +
+						"`chaos kill <name>` - Kill specific container (chaos mode)"
 				case "status":
 					health, _ := monitor.GetSystemHealth()
 					provider := os.Getenv("LLM_PROVIDER")
@@ -458,6 +461,27 @@ func main() {
 							msgText = "☸️ **KUBERNETES CLUSTER**\n\n" + info
 						}
 					}
+				case "chaos":
+					if !chaos.Enabled() {
+						msgText = "⚠️ **Chaos mode disabled.**\nSet `CHAOS_ENABLED=true` in your .env to enable fault injection.\n\n_Gunakan dengan berhati-hati — ini akan stop container secara rawak!_"
+					} else {
+						ctx10 := context.Background()
+						result, err := chaos.KillRandom(ctx10)
+						if err != nil {
+							msgText = fmt.Sprintf("❌ Chaos kill failed: %v", err)
+						} else {
+							audit.Log(audit.Event{
+								Type:   "action",
+								Actor:  "user",
+								Action: "ChaosKill",
+								Target: result.ContainerName,
+								Status: "ok",
+								Detail: "random kill via /chaos command",
+							})
+							metrics.AlertsTotal.WithLabelValues("chaos_kill").Inc()
+							msgText = chaos.FormatResult(result)
+						}
+					}
 				case "reset":
 					os.Remove(stateFile)
 					select {
@@ -534,6 +558,38 @@ func main() {
 				}
 			}
 
+			// "chaos kill <name>" — targeted chaos injection.
+			if strings.HasPrefix(strings.ToLower(input), "chaos kill ") {
+				parts := strings.SplitN(input, " ", 3)
+				if len(parts) == 3 {
+					targetName := parts[2]
+					var txt string
+					if !chaos.Enabled() {
+						txt = "⚠️ Chaos mode disabled — set CHAOS_ENABLED=true to use chaos injection."
+					} else {
+						result, err := chaos.KillNamed(context.Background(), targetName)
+						if err != nil {
+							txt = fmt.Sprintf("❌ Chaos kill failed: %v", err)
+						} else {
+							audit.Log(audit.Event{
+								Type:   "action",
+								Actor:  "user",
+								Action: "ChaosKill",
+								Target: result.ContainerName,
+								Status: "ok",
+								Detail: "named kill via chaos kill inline command",
+							})
+							metrics.AlertsTotal.WithLabelValues("chaos_kill").Inc()
+							txt = chaos.FormatResult(result)
+						}
+					}
+					msg := tgbotapi.NewMessage(update.Message.Chat.ID, txt)
+					msg.ParseMode = "Markdown"
+					safeSend(bot, msg)
+					continue
+				}
+			}
+
 			msgLoader := tgbotapi.NewMessage(update.Message.Chat.ID, "🧠 Gopher-Ops is thinking...")
 			sentLoader, _ := safeSend(bot, msgLoader)
 
@@ -597,6 +653,10 @@ func main() {
 						btnText = "☸️ Describe Pod " + targetName
 					case "K8sRestartDeployment":
 						btnText = "☸️ Restart Deployment " + targetName
+					case "ChaosKillRandom":
+						btnText = "💥 Chaos: Kill Random Container"
+					case "ChaosKill":
+						btnText = "💥 Chaos Kill " + targetName
 					case "InvestigateNetwork":
 						btnText = "🌐 Triage: Network " + targetName
 					case "CheckConfig":
@@ -774,6 +834,32 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		} else {
 			auditAction("K8sRestartDeployment", target, nil)
 			resMsg = out
+		}
+	case "ChaosKillRandom":
+		if !chaos.Enabled() {
+			resMsg = "⚠️ Chaos mode disabled — set CHAOS_ENABLED=true to enable."
+		} else {
+			result, err := chaos.KillRandom(context.Background())
+			auditAction("ChaosKill", "random", err)
+			if err != nil {
+				resMsg = fmt.Sprintf("❌ Chaos kill failed: %v", err)
+			} else {
+				metrics.AlertsTotal.WithLabelValues("chaos_kill").Inc()
+				resMsg = chaos.FormatResult(result)
+			}
+		}
+	case "ChaosKill":
+		if !chaos.Enabled() {
+			resMsg = "⚠️ Chaos mode disabled — set CHAOS_ENABLED=true to enable."
+		} else {
+			result, err := chaos.KillNamed(context.Background(), target)
+			auditAction("ChaosKill", target, err)
+			if err != nil {
+				resMsg = fmt.Sprintf("❌ Chaos kill failed: %v", err)
+			} else {
+				metrics.AlertsTotal.WithLabelValues("chaos_kill").Inc()
+				resMsg = chaos.FormatResult(result)
+			}
 		}
 	default:
 		resMsg = "Action tak jumpa wtf ahaha"
