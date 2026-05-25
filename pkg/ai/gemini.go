@@ -5,8 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
-	"time"
 
 	"github.com/google/generative-ai-go/genai"
 	"google.golang.org/api/option"
@@ -16,22 +14,6 @@ import (
 	"gopher-ops/pkg/mcp"
 	"gopher-ops/pkg/monitor"
 )
-
-// aiTimeout caps every Gemini round-trip. Configurable via AI_TIMEOUT_SECONDS.
-var aiTimeout = func() time.Duration {
-	if v := os.Getenv("AI_TIMEOUT_SECONDS"); v != "" {
-		if n, err := time.ParseDuration(v + "s"); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 60 * time.Second
-}()
-
-// destructiveAllowed gates whether the AI can directly execute Stop/Restart
-// without human confirmation. Default is false (HITL required).
-func destructiveAllowed() bool {
-	return os.Getenv("AI_DESTRUCTIVE_ALLOWED") == "true"
-}
 
 func isDestructive(toolName string) bool {
 	switch toolName {
