@@ -423,6 +423,8 @@ func main() {
 						btnText = "🛡️ Audit Security Level"
 					case "VisualMetrics":
 						btnText = "📊 Show System Pulse"
+					case "ContainerStats":
+						btnText = "📦 Live Container Stats"
 					case "InvestigateNetwork":
 						btnText = "🌐 Triage: Network " + targetName
 					case "CheckConfig":
@@ -567,6 +569,8 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 	case "VisualMetrics":
 		metrics, _ := monitor.GetVisualMetrics()
 		resMsg = metrics
+	case "ContainerStats":
+		resMsg = monitor.FormatContainerStats()
 	default:
 		resMsg = "Action tak jumpa wtf ahaha"
 	}
@@ -700,6 +704,15 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 			continue
 		case <-ticker.C:
 		}
+
+		// Collect per-container CPU/RAM in the background; errors are non-fatal.
+		go func() {
+			collectCtx, collectCancel := context.WithTimeout(ctx, 30*time.Second)
+			defer collectCancel()
+			if err := monitor.CollectContainerStats(collectCtx); err != nil {
+				slog.Warn("container stats collection failed", "error", err)
+			}
+		}()
 
 		currentStates, err := monitor.GetContainerStates()
 		if err != nil {
