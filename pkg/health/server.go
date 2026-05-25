@@ -1,6 +1,4 @@
-// Package health serves a minimal HTTP /health endpoint so external monitors
-// (Kubernetes liveness probes, uptime checkers, load balancers) can verify
-// the bot is alive without joining the Telegram conversation.
+// Package health serves HTTP endpoints for liveness probes and metrics scraping.
 package health
 
 import (
@@ -9,26 +7,49 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"gopher-ops/pkg/metrics"
 )
+
+// SubsystemStatus captures the health of one dependency.
+type SubsystemStatus struct {
+	OK      bool   `json:"ok"`
+	Message string `json:"message,omitempty"`
+}
 
 // Status is the JSON payload returned by GET /health.
 type Status struct {
-	Status        string `json:"status"`
-	UptimeSeconds int64  `json:"uptime_seconds"`
+	Status     string                     `json:"status"`
+	Uptime     int64                      `json:"uptime_seconds"`
+	Version    string                     `json:"version,omitempty"`
+	Subsystems map[string]SubsystemStatus `json:"subsystems,omitempty"`
 }
 
-// Server is the HTTP health endpoint.
+// SubsystemProber is a function that checks one subsystem and returns
+// whether it is healthy and an optional message.
+type SubsystemProber func(ctx context.Context) SubsystemStatus
+
+// Server is the HTTP health + metrics endpoint.
 type Server struct {
 	port      string
 	startTime time.Time
+	version   string
+	probers   map[string]SubsystemProber
 	srv       *http.Server
 }
 
-func New(port string) *Server {
+func New(port, version string) *Server {
 	return &Server{
 		port:      port,
 		startTime: time.Now(),
+		version:   version,
+		probers:   make(map[string]SubsystemProber),
 	}
+}
+
+// AddProber registers a named subsystem health check.
+func (s *Server) AddProber(name string, fn SubsystemProber) {
+	s.probers[name] = fn
 }
 
 // Start launches the HTTP server in a goroutine and arranges shutdown on ctx
@@ -36,6 +57,7 @@ func New(port string) *Server {
 func (s *Server) Start(ctx context.Context) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", s.handleHealth)
+	mux.Handle("/metrics", metrics.Handler())
 	mux.HandleFunc("/", s.handleHealth)
 
 	s.srv = &http.Server{
@@ -45,7 +67,7 @@ func (s *Server) Start(ctx context.Context) {
 	}
 
 	go func() {
-		slog.Info("🩺 Health server listening", "port", s.port)
+		slog.Info("🩺 Health server listening", "port", s.port, "metrics", "/metrics")
 		if err := s.srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			slog.Error("health server failed", "error", err)
 		}
@@ -60,9 +82,27 @@ func (s *Server) Start(ctx context.Context) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	probeCtx, cancel := context.WithTimeout(r.Context(), 3*time.Second)
+	defer cancel()
+
+	subsystems := make(map[string]SubsystemStatus, len(s.probers))
+	overall := "ok"
+	for name, probe := range s.probers {
+		result := probe(probeCtx)
+		subsystems[name] = result
+		if !result.OK {
+			overall = "degraded"
+		}
+	}
+
 	w.Header().Set("Content-Type", "application/json")
+	if overall != "ok" {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
 	_ = json.NewEncoder(w).Encode(Status{
-		Status:        "ok",
-		UptimeSeconds: int64(time.Since(s.startTime).Seconds()),
+		Status:     overall,
+		Uptime:     int64(time.Since(s.startTime).Seconds()),
+		Version:    s.version,
+		Subsystems: subsystems,
 	})
 }

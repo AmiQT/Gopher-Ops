@@ -59,6 +59,16 @@ func (s *MetricStore) PushMetrics(cpuLoad, ramLoad float64) {
 	}
 }
 
+// LatestPoint returns the most recent MetricPoint, or a zero value if the store is empty.
+func (s *MetricStore) LatestPoint() MetricPoint {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if len(s.Points) == 0 {
+		return MetricPoint{}
+	}
+	return s.Points[len(s.Points)-1]
+}
+
 // CheckSustainedLoad returns true if the average CPU over the last N points exceeds threshold.
 func (s *MetricStore) CheckSustainedLoad(threshold float64, count int) bool {
 	s.mu.RLock()

@@ -19,6 +19,7 @@ import (
 	"gopher-ops/pkg/ai"
 	"gopher-ops/pkg/audit"
 	"gopher-ops/pkg/health"
+	"gopher-ops/pkg/metrics"
 	"gopher-ops/pkg/monitor"
 	"gopher-ops/pkg/notify"
 	"gopher-ops/pkg/ratelimit"
@@ -69,6 +70,9 @@ func safeSend(bot *tgbotapi.BotAPI, msg tgbotapi.Chattable) (tgbotapi.Message, e
 	sent, err := bot.Send(msg)
 	if err != nil {
 		slog.Warn("telegram send failed", "error", err)
+		metrics.TelegramMsgTotal.WithLabelValues("error").Inc()
+	} else {
+		metrics.TelegramMsgTotal.WithLabelValues("ok").Inc()
 	}
 	return sent, err
 }
@@ -233,9 +237,26 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// 4. Optional /health HTTP endpoint
+	// 4. Register Prometheus metrics and start health+metrics HTTP server.
+	metrics.Register()
 	if port := os.Getenv("HEALTH_PORT"); port != "" {
-		health.New(port).Start(ctx)
+		srv := health.New(port, version)
+		// Docker daemon liveness probe
+		srv.AddProber("docker", func(ctx context.Context) health.SubsystemStatus {
+			_, err := monitor.GetContainerStates()
+			if err != nil {
+				return health.SubsystemStatus{OK: false, Message: err.Error()}
+			}
+			return health.SubsystemStatus{OK: true}
+		})
+		// Telegram reachability probe (uses cached bot.Self which is always set after init)
+		srv.AddProber("telegram", func(_ context.Context) health.SubsystemStatus {
+			if bot.Self.UserName == "" {
+				return health.SubsystemStatus{OK: false, Message: "bot not initialised"}
+			}
+			return health.SubsystemStatus{OK: true}
+		})
+		srv.Start(ctx)
 	}
 
 	// 5. Async Telegram broadcaster (fan-out to all authorized operators)
@@ -517,6 +538,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		if err != nil {
 			resMsg = fmt.Sprintf("❌ Aduh, AI pening nak analyze: %v", err)
 		} else {
+			metrics.RCATotal.Inc()
 			resMsg = fmt.Sprintf("🧐 **ANALISIS RCA: %s**\n\n%s", safeMD(name), analysis)
 		}
 	case "TerraformApply":
@@ -709,12 +731,41 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 		case <-ticker.C:
 		}
 
-		// Collect per-container CPU/RAM in the background; errors are non-fatal.
+		// Collect per-container stats then push all values to Prometheus.
 		go func() {
 			collectCtx, collectCancel := context.WithTimeout(ctx, 30*time.Second)
 			defer collectCancel()
 			if err := monitor.CollectContainerStats(collectCtx); err != nil {
 				slog.Warn("container stats collection failed", "error", err)
+				return
+			}
+			for _, s := range monitor.GetContainerStatSnapshot() {
+				metrics.ContainerCPUPct.WithLabelValues(s.Name).Set(s.CPUPct)
+				metrics.ContainerRAMUsedMB.WithLabelValues(s.Name).Set(s.MemUsedMB)
+				metrics.ContainerRAMPct.WithLabelValues(s.Name).Set(s.MemPct)
+				metrics.ContainerNetRxMB.WithLabelValues(s.Name).Set(s.NetRxMB)
+				metrics.ContainerNetTxMB.WithLabelValues(s.Name).Set(s.NetTxMB)
+				metrics.ContainerBlkReadMB.WithLabelValues(s.Name).Set(s.BlkReadMB)
+				metrics.ContainerBlkWriteMB.WithLabelValues(s.Name).Set(s.BlkWriteMB)
+				metrics.ContainerPIDs.WithLabelValues(s.Name).Set(float64(s.PIDs))
+				up := 0.0
+				if s.State == "running" {
+					up = 1.0
+				}
+				metrics.ContainerUp.WithLabelValues(s.Name).Set(up)
+			}
+			// Push host-level figures
+			if last := monitor.GlobalMetricStore.LatestPoint(); !last.Timestamp.IsZero() {
+				metrics.HostCPUPct.Set(last.CPU)
+				metrics.HostRAMPct.Set(last.RAM)
+			}
+			// Push disk figures
+			if usages, err := monitor.GetDiskUsage(); err == nil {
+				for _, u := range usages {
+					metrics.DiskUsedPct.WithLabelValues(u.Mount, u.Filesystem).Set(u.UsedPct)
+					metrics.DiskUsedGB.WithLabelValues(u.Mount, u.Filesystem).Set(u.UsedGB)
+					metrics.DiskTotalGB.WithLabelValues(u.Mount, u.Filesystem).Set(u.TotalGB)
+				}
 			}
 		}()
 
@@ -794,6 +845,7 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 					}
 					alertState[id] = "alert_sent"
 					alertSentAt[id] = time.Now()
+					metrics.AlertsTotal.WithLabelValues("container_down").Inc()
 					audit.Log(audit.Event{
 						Type: "alert", Actor: "system", Action: "container_down",
 						Target: id, Status: "info", Detail: current.Name,
@@ -850,6 +902,7 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 					broadcaster.Broadcast(notify.Broadcast{Text: alertMsg, ParseMode: "Markdown"})
 					alertState[key] = "high"
 					alertSentAt[key] = time.Now()
+					metrics.AlertsTotal.WithLabelValues("disk_high").Inc()
 					audit.Log(audit.Event{Type: "alert", Actor: "system", Action: "disk_high", Target: a.Mount, Status: "fired"})
 				}
 			}
