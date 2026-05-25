@@ -63,6 +63,57 @@ func TestCalcCPUPercent_Basic(t *testing.T) {
 	}
 }
 
+func TestSumNetworkBytes(t *testing.T) {
+	nets := map[string]dockertypes.NetworkStats{
+		"eth0": {RxBytes: 1000, TxBytes: 500},
+		"eth1": {RxBytes: 200, TxBytes: 50},
+	}
+	rx, tx := sumNetworkBytes(nets)
+	if rx != 1200 {
+		t.Errorf("rx total = %d, want 1200", rx)
+	}
+	if tx != 550 {
+		t.Errorf("tx total = %d, want 550", tx)
+	}
+}
+
+func TestSumBlkioBytes(t *testing.T) {
+	bio := dockertypes.BlkioStats{
+		IoServiceBytesRecursive: []dockertypes.BlkioStatEntry{
+			{Op: "Read", Value: 1000},
+			{Op: "Write", Value: 2000},
+			{Op: "Read", Value: 500},
+			{Op: "Sync", Value: 9999}, // must be ignored
+			{Op: "Total", Value: 9999}, // must be ignored
+		},
+	}
+	r, w := sumBlkioBytes(bio)
+	if r != 1500 {
+		t.Errorf("read total = %d, want 1500", r)
+	}
+	if w != 2000 {
+		t.Errorf("write total = %d, want 2000", w)
+	}
+}
+
+func TestHumanBytesMB(t *testing.T) {
+	cases := []struct {
+		mb   float64
+		want string
+	}{
+		{2048, "2.00 GB"},
+		{1500, "1.46 GB"},
+		{42.5, "42.5 MB"},
+		{0.5, "512 KB"},
+	}
+	for _, c := range cases {
+		got := humanBytesMB(c.mb)
+		if got != c.want {
+			t.Errorf("humanBytesMB(%.2f) = %q, want %q", c.mb, got, c.want)
+		}
+	}
+}
+
 func TestFormatContainerStats_Empty(t *testing.T) {
 	// With an empty store the output should not panic and should say "no running containers".
 	globalContainerStats.mu.Lock()

@@ -16,13 +16,18 @@ import (
 
 // ContainerStat holds a single real-time snapshot for one container.
 type ContainerStat struct {
-	ID        string
-	Name      string
-	State     string
-	CPUPct    float64
-	MemUsedMB float64
-	MemLimitMB float64
-	MemPct    float64
+	ID          string
+	Name        string
+	State       string
+	CPUPct      float64
+	MemUsedMB   float64
+	MemLimitMB  float64
+	MemPct      float64
+	NetRxMB     float64 // total bytes received (cumulative since container start)
+	NetTxMB     float64 // total bytes transmitted (cumulative)
+	BlkReadMB   float64 // total bytes read from block devices (cumulative)
+	BlkWriteMB  float64 // total bytes written to block devices (cumulative)
+	PIDs        uint64  // number of running processes inside the container
 	CollectedAt time.Time
 }
 
@@ -34,6 +39,32 @@ type containerStatStore struct {
 
 var globalContainerStats = &containerStatStore{
 	stats: make(map[string]ContainerStat),
+}
+
+// sumNetworkBytes aggregates rx/tx across every network interface on the
+// container (a container can be attached to multiple networks).
+func sumNetworkBytes(nets map[string]dockertypes.NetworkStats) (rxBytes, txBytes uint64) {
+	for _, n := range nets {
+		rxBytes += n.RxBytes
+		txBytes += n.TxBytes
+	}
+	return
+}
+
+// sumBlkioBytes walks the io_service_bytes_recursive list and totals Read/Write.
+// Other ops (Sync, Async, Discard, Total) are intentionally ignored — the
+// Total entry double-counts Read+Write and the rest are not useful for an
+// at-a-glance disk I/O view.
+func sumBlkioBytes(bio dockertypes.BlkioStats) (read, write uint64) {
+	for _, e := range bio.IoServiceBytesRecursive {
+		switch e.Op {
+		case "Read", "read":
+			read += e.Value
+		case "Write", "write":
+			write += e.Value
+		}
+	}
+	return
 }
 
 // calcCPUPercent derives CPU% from a Docker stats snapshot using the standard
@@ -87,14 +118,23 @@ func fetchOneStat(ctx context.Context, id, name, state string) (ContainerStat, e
 		memPct = float64(raw.MemoryStats.Usage) / float64(raw.MemoryStats.Limit) * 100.0
 	}
 
+	rxBytes, txBytes := sumNetworkBytes(raw.Networks)
+	blkRead, blkWrite := sumBlkioBytes(raw.BlkioStats)
+	const mb = 1024.0 * 1024.0
+
 	return ContainerStat{
-		ID:         id[:8],
-		Name:       name,
-		State:      state,
-		CPUPct:     cpuPct,
-		MemUsedMB:  memUsed,
-		MemLimitMB: memLimit,
-		MemPct:     memPct,
+		ID:          id[:8],
+		Name:        name,
+		State:       state,
+		CPUPct:      cpuPct,
+		MemUsedMB:   memUsed,
+		MemLimitMB:  memLimit,
+		MemPct:      memPct,
+		NetRxMB:     float64(rxBytes) / mb,
+		NetTxMB:     float64(txBytes) / mb,
+		BlkReadMB:   float64(blkRead) / mb,
+		BlkWriteMB:  float64(blkWrite) / mb,
+		PIDs:        raw.PidsStats.Current,
 		CollectedAt: time.Now(),
 	}, nil
 }
@@ -157,6 +197,19 @@ func GetContainerStatSnapshot() []ContainerStat {
 	return out
 }
 
+// humanBytesMB renders a byte count (already in MB) with a unit that scales.
+// Avoids displaying "15234 MB" when "14.9 GB" is friendlier.
+func humanBytesMB(mb float64) string {
+	switch {
+	case mb >= 1024:
+		return fmt.Sprintf("%.2f GB", mb/1024)
+	case mb >= 1:
+		return fmt.Sprintf("%.1f MB", mb)
+	default:
+		return fmt.Sprintf("%.0f KB", mb*1024)
+	}
+}
+
 // FormatContainerStats returns a Telegram-ready text table of live container metrics.
 func FormatContainerStats() string {
 	stats := GetContainerStatSnapshot()
@@ -171,10 +224,17 @@ func FormatContainerStats() string {
 		sb.WriteString(fmt.Sprintf("🟢 **%s**\n", s.Name))
 		sb.WriteString(fmt.Sprintf("   CPU : `[%-20s]` %.1f%%\n", asciiBar(s.CPUPct), s.CPUPct))
 		if s.MemLimitMB > 0 {
-			sb.WriteString(fmt.Sprintf("   RAM : `[%-20s]` %.1f%% (%.0f / %.0f MB)\n",
-				asciiBar(s.MemPct), s.MemPct, s.MemUsedMB, s.MemLimitMB))
+			sb.WriteString(fmt.Sprintf("   RAM : `[%-20s]` %.1f%% (%s / %s)\n",
+				asciiBar(s.MemPct), s.MemPct, humanBytesMB(s.MemUsedMB), humanBytesMB(s.MemLimitMB)))
 		} else {
-			sb.WriteString(fmt.Sprintf("   RAM : %.0f MB (no limit set)\n", s.MemUsedMB))
+			sb.WriteString(fmt.Sprintf("   RAM : %s (no limit)\n", humanBytesMB(s.MemUsedMB)))
+		}
+		sb.WriteString(fmt.Sprintf("   NET : ↓ %s rx  ↑ %s tx\n",
+			humanBytesMB(s.NetRxMB), humanBytesMB(s.NetTxMB)))
+		sb.WriteString(fmt.Sprintf("   DISK: ↻ %s read  ↺ %s write\n",
+			humanBytesMB(s.BlkReadMB), humanBytesMB(s.BlkWriteMB)))
+		if s.PIDs > 0 {
+			sb.WriteString(fmt.Sprintf("   PIDs: %d processes\n", s.PIDs))
 		}
 		sb.WriteString(fmt.Sprintf("   _(collected %s ago)_\n\n", age))
 	}
