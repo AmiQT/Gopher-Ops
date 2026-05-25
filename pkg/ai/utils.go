@@ -70,5 +70,11 @@ func ExtractIntents(output string) []ActionIntent {
 		intents = append(intents, ActionIntent{Action: "ContainerStats", Target: ""})
 	}
 
+	// DISK USAGE (host filesystem usage)
+	diskRe := regexp.MustCompile(`DiskUsage\(\)`)
+	if diskRe.MatchString(output) {
+		intents = append(intents, ActionIntent{Action: "DiskUsage", Target: ""})
+	}
+
 	return intents
 }
