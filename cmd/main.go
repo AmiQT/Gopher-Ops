@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime/debug"
 	"strconv"
 	"strings"
 	"sync"
@@ -25,6 +26,52 @@ import (
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 	"github.com/joho/godotenv"
 )
+
+// version is populated from the Go build's embedded VCS info. It surfaces in
+// /status so operators always know which commit they're talking to.
+var version = func() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok {
+		return "dev"
+	}
+	var commit, when string
+	var modified bool
+	for _, s := range info.Settings {
+		switch s.Key {
+		case "vcs.revision":
+			commit = s.Value
+		case "vcs.time":
+			when = s.Value
+		case "vcs.modified":
+			modified = s.Value == "true"
+		}
+	}
+	if commit == "" {
+		return "dev"
+	}
+	short := commit
+	if len(short) > 7 {
+		short = short[:7]
+	}
+	if modified {
+		short += "-dirty"
+	}
+	if when != "" {
+		return fmt.Sprintf("%s (%s)", short, when)
+	}
+	return short
+}()
+
+// safeSend wraps bot.Send so a failed delivery is logged instead of silently
+// vanishing. Returns the Message and the underlying error so callers that
+// need the message ID can still use it.
+func safeSend(bot *tgbotapi.BotAPI, msg tgbotapi.Chattable) (tgbotapi.Message, error) {
+	sent, err := bot.Send(msg)
+	if err != nil {
+		slog.Warn("telegram send failed", "error", err)
+	}
+	return sent, err
+}
 
 const (
 	stateFile       = "state.json"
@@ -59,11 +106,14 @@ func main() {
 		Level: slog.LevelInfo,
 	})))
 
-	slog.Info("🤖 Booting up Gopher-Ops SRE Telegram Bot...")
+	slog.Info("🤖 Booting up Gopher-Ops SRE Telegram Bot...", "version", version)
 
 	if err := godotenv.Load(); err != nil {
 		slog.Warn("No .env file found — credentials must be set via environment")
 	}
+
+	// Critical: must run AFTER godotenv.Load() so .env values apply.
+	ai.LoadEnvConfig()
 
 	if p := os.Getenv("AUDIT_LOG_PATH"); p != "" {
 		audit.SetPath(p)
@@ -198,7 +248,11 @@ func main() {
 	broadcaster := notify.NewQueue(bot, authorizedIDs, queueSize)
 	go broadcaster.Run(ctx)
 
-	// 6. Start Background Monitor with panic recovery and auto-restart
+	// 6. Reset channel — lets /reset signal the monitor goroutine to flush
+	// its in-memory trackers (not just delete state.json).
+	resetCh := make(chan struct{}, 1)
+
+	// 7. Start Background Monitor with panic recovery and auto-restart
 	go func() {
 		for {
 			func() {
@@ -207,7 +261,7 @@ func main() {
 						slog.Error("🔥 Background monitor panicked — restarting", "panic", r)
 					}
 				}()
-				startBackgroundMonitor(ctx, broadcaster, agent, cpuThreshold, cpuDuration, alertCooldown)
+				startBackgroundMonitor(ctx, broadcaster, agent, resetCh, cpuThreshold, cpuDuration, alertCooldown)
 			}()
 
 			select {
@@ -258,7 +312,7 @@ func main() {
 			chatID := update.Message.Chat.ID
 			if !authorizedSet[chatID] {
 				msg := tgbotapi.NewMessage(chatID, "❌ Warganegara asing dilarang masuk. Kau sapa takde access level nak borak dengan aku bro. GG.")
-				bot.Send(msg)
+				safeSend(bot, msg)
 				audit.Log(audit.Event{
 					Type: "alert", Actor: "system", Action: "unauthorized_access",
 					Target: strconv.FormatInt(chatID, 10), Status: "info",
@@ -268,7 +322,7 @@ func main() {
 
 			if !limiter.Allow(chatID) {
 				msg := tgbotapi.NewMessage(chatID, "⏳ Whoa, slow down bro! Limit kau dah cecah. Try semula dalam seminit.")
-				bot.Send(msg)
+				safeSend(bot, msg)
 				continue
 			}
 
@@ -288,19 +342,26 @@ func main() {
 						autoPilot = "ACTIVE ✅ (Self-Healing On)"
 					}
 					msgText = fmt.Sprintf("🤖 **GOPHER-OPS STATUS**\n\n"+
+						"🔖 **Version:** %s\n"+
 						"🧠 **AI Engine:** %s (%s)\n"+
-						"🤖 **Autopilot:** %s\n\n"+
+						"🤖 **Autopilot:** %s\n"+
+						"👥 **Operators:** %d configured\n\n"+
 						"📊 **Live Metrics:**\n%s",
-						strings.ToUpper(provider), model, autoPilot, health)
+						version, strings.ToUpper(provider), model, autoPilot, len(authorizedIDs), health)
 				case "reset":
-					os.Remove("state.json")
+					os.Remove(stateFile)
+					select {
+					case resetCh <- struct{}{}:
+					default: // already pending — fine
+					}
+					audit.Log(audit.Event{Type: "action", Actor: "user", Action: "reset_state", Status: "ok"})
 					msgText = "🧹 **STATE CLEARED!** Hafiz dah lupa sejarah lama. Kita mula hidup baru."
 				default:
 					msgText = "Command apa tu mat? Aku tak faham ah. 😂"
 				}
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID, msgText)
 				msg.ParseMode = "Markdown"
-				bot.Send(msg)
+				safeSend(bot, msg)
 				continue
 			}
 
@@ -309,19 +370,19 @@ func main() {
 				agent.ResetSession()
 				msg := tgbotapi.NewMessage(update.Message.Chat.ID, "🧹 Gopher-Ops: Chat memory cleared! Token history reset jadi 0. Jimat token LFG! ✨")
 				msg.ParseMode = "Markdown"
-				bot.Send(msg)
+				safeSend(bot, msg)
 				continue
 			}
 
 			msgLoader := tgbotapi.NewMessage(update.Message.Chat.ID, "🧠 Gopher-Ops is thinking...")
-			sentLoader, _ := bot.Send(msgLoader)
+			sentLoader, _ := safeSend(bot, msgLoader)
 
 			response, intents, err := agent.ProcessRequest(input)
 			if err != nil {
 				slog.Error("AI ProcessRequest failed", "error", err)
 				respMsg := tgbotapi.NewEditMessageText(update.Message.Chat.ID, sentLoader.MessageID, fmt.Sprintf("❌ Error borak: %v", err))
 				respMsg.ParseMode = "Markdown"
-				bot.Send(respMsg)
+				safeSend(bot, respMsg)
 				continue
 			}
 
@@ -375,7 +436,7 @@ func main() {
 				respMsg.ReplyMarkup = &keyboard
 			}
 
-			bot.Send(respMsg)
+			safeSend(bot, respMsg)
 		}
 	}
 }
@@ -387,7 +448,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 
 	parts := strings.Split(callback.Data, ":")
 	if len(parts) != 2 {
-		bot.Send(tgbotapi.NewMessage(callback.Message.Chat.ID, "❌ Callback data rosak bro."))
+		safeSend(bot, tgbotapi.NewMessage(callback.Message.Chat.ID, "❌ Callback data rosak bro."))
 		return
 	}
 
@@ -444,7 +505,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 
 		msgProc := tgbotapi.NewMessage(callback.Message.Chat.ID, "🔍 *Gopher-Ops sedang menganalisis log... Sabar jap.*")
 		msgProc.ParseMode = "Markdown"
-		bot.Send(msgProc)
+		safeSend(bot, msgProc)
 
 		evidence := buildRCAEvidence(target)
 		analysis, err := agent.DiagnoseIssue(name, evidence)
@@ -467,7 +528,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 
 		msgProc := tgbotapi.NewMessage(callback.Message.Chat.ID, "🛡️ *Gopher-Ops sedang melakukan audit keselamatan...*")
 		msgProc.ParseMode = "Markdown"
-		bot.Send(msgProc)
+		safeSend(bot, msgProc)
 
 		analysis, err := agent.AuditSecurity(data, imageScanData)
 		if err != nil {
@@ -481,7 +542,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 
 		msgProc := tgbotapi.NewMessage(callback.Message.Chat.ID, "🌐 *Gopher-Ops sedang memeriksa rangkaian...*")
 		msgProc.ParseMode = "Markdown"
-		bot.Send(msgProc)
+		safeSend(bot, msgProc)
 
 		analysis, err := agent.TriageIssue(name, "Network Connectivity", data)
 		if err != nil {
@@ -495,7 +556,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 
 		msgProc := tgbotapi.NewMessage(callback.Message.Chat.ID, "⚙️ *Gopher-Ops sedang memeriksa konfigurasi...*")
 		msgProc.ParseMode = "Markdown"
-		bot.Send(msgProc)
+		safeSend(bot, msgProc)
 
 		analysis, err := agent.TriageIssue(name, "Configuration Validation", data)
 		if err != nil {
@@ -511,7 +572,7 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 	}
 
 	msg := tgbotapi.NewMessage(callback.Message.Chat.ID, resMsg)
-	bot.Send(msg)
+	safeSend(bot, msg)
 }
 
 // buildRCAEvidence assembles the inspect post-mortem, system metric snapshot,
@@ -552,7 +613,11 @@ func buildRCAEvidence(containerID string) string {
 // alerts to every authorized operator via the async notify queue. The
 // broadcaster decouples this loop from Telegram API latency, so a slow API
 // cannot stall container-state polling.
-func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agent ai.AIAgent, cpuThreshold float64, cpuDuration int, alertCooldown time.Duration) {
+//
+// `resetCh` is a signal channel that lets the /reset command flush the
+// in-memory trackers — without it, /reset only deletes state.json while the
+// goroutine keeps stale restart counters and cooldowns in memory.
+func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agent ai.AIAgent, resetCh <-chan struct{}, cpuThreshold float64, cpuDuration int, alertCooldown time.Duration) {
 	slog.Info("🩺 Background monitor started",
 		"cpu_threshold", cpuThreshold,
 		"cpu_duration_min", cpuDuration,
@@ -623,6 +688,16 @@ func startBackgroundMonitor(ctx context.Context, broadcaster *notify.Queue, agen
 		case <-ctx.Done():
 			slog.Info("Background monitor stopping")
 			return
+		case <-resetCh:
+			slog.Info("🧹 Monitor state reset via /reset command")
+			restartTracker = make(map[string]int)
+			alertState = make(map[string]string)
+			alertSentAt = make(map[string]time.Time)
+			for k := range rcaCache {
+				delete(rcaCache, k)
+			}
+			audit.Log(audit.Event{Type: "action", Actor: "system", Action: "monitor_reset", Status: "ok"})
+			continue
 		case <-ticker.C:
 		}
 

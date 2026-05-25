@@ -1,32 +1,45 @@
 package actions
 
 import (
+	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"time"
 )
 
-// TerraformApply runs a terraform apply command in the terraform directory.
-// For safety in this demo, it uses -auto-approve.
-func TerraformApply() (string, error) {
-	// Path to terraform folder relative to project root
-	tfDir := "./terraform"
+const terraformTimeout = 5 * time.Minute
 
-	cmd := exec.Command("terraform", "apply", "-auto-approve")
+// TerraformApply runs a terraform apply command in the configured directory.
+// The working directory is taken from TERRAFORM_DIR (default "./terraform"),
+// and the run is bounded by a 5-minute context timeout so a stuck plan
+// cannot hang the bot indefinitely.
+//
+// Safety note: this uses -auto-approve. Gate the calling button (or the AI
+// destructive-tool safe mode) before exposing this to untrusted operators.
+func TerraformApply() (string, error) {
+	tfDir := os.Getenv("TERRAFORM_DIR")
+	if tfDir == "" {
+		tfDir = "./terraform"
+	}
+
+	if info, err := os.Stat(tfDir); err != nil || !info.IsDir() {
+		return "", fmt.Errorf("terraform dir %q not accessible: %w", tfDir, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), terraformTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, "terraform", "apply", "-auto-approve")
 	cmd.Dir = tfDir
 
 	out, err := cmd.CombinedOutput()
+	if ctx.Err() == context.DeadlineExceeded {
+		return string(out), fmt.Errorf("terraform apply timed out after %s", terraformTimeout)
+	}
 	if err != nil {
-		return string(out), fmt.Errorf("terraform apply failed: %v", err)
+		return string(out), fmt.Errorf("terraform apply failed: %w", err)
 	}
 
 	return "Terraform apply completed successfully!\n" + string(out), nil
-}
-
-// ScaleRedis updates the variables.tf or a tfvars file to scale nodes.
-// For simplicity in this agentic demo, we might just trigger a re-apply 
-// if the user has manually changed the file, or we could use sed/regex to update it.
-func ScaleRedis(count int) (string, error) {
-	// This is a placeholder for a more complex file editing logic.
-	// For now, let's just return a message saying it's triggered.
-	return fmt.Sprintf("Scaling Redis to %d nodes... (Logic to update .tf files pending implementation)", count), nil
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 
 	"gopher-ops/pkg/docker"
@@ -65,9 +66,12 @@ func StopContainer(containerID string) (string, error) {
 	return fmt.Sprintf("Successfully stopped container %s", containerID), nil
 }
 
-// ClearCache simulates a cleanup or cache clearing operation.
+// ClearCache is intentionally NOT implemented — cache clearing is highly
+// environment-specific (Redis FLUSHALL? OS page cache? application-level?)
+// and silently pretending to succeed would be dishonest. The diagnostic
+// string below tells the operator exactly that.
 func ClearCache() string {
-	return "System cache cleared successfully. Memory impact should decrease."
+	return "ℹ️ ClearCache is not implemented in this build — cache clearing depends on the target (Redis FLUSHALL, OS drop_caches, etc.). Wire up actions.ClearCache() for your stack."
 }
 
 // GetContainerLogs fetches the last 10 lines of logs for a container.
@@ -111,12 +115,145 @@ func GetContainerLogsN(containerID string, lines int) (string, error) {
 	return buf.String(), nil
 }
 
-// InvestigateNetwork simulates checking connectivity for a container.
+// InvestigateNetwork returns the container's real network configuration via
+// docker inspect: connected networks, IP/gateway per network, port bindings,
+// DNS overrides, and a connectivity assessment based on the running state.
 func InvestigateNetwork(containerID string) string {
-	return "NETWORK ANALYSIS: Container can reach external network. No obvious DNS or Routing issues found."
+	cli, err := docker.Get()
+	if err != nil {
+		return fmt.Sprintf("NETWORK ANALYSIS: docker client unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+
+	inspect, err := cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return fmt.Sprintf("NETWORK ANALYSIS: inspect failed: %v", err)
+	}
+
+	var sb strings.Builder
+	name := strings.TrimPrefix(inspect.Name, "/")
+	sb.WriteString(fmt.Sprintf("NETWORK ANALYSIS for %s:\n", name))
+	sb.WriteString(fmt.Sprintf("- Running: %v\n", inspect.State.Running))
+
+	if inspect.NetworkSettings == nil || len(inspect.NetworkSettings.Networks) == 0 {
+		sb.WriteString("- Networks: none attached\n")
+	} else {
+		sb.WriteString(fmt.Sprintf("- Networks (%d):\n", len(inspect.NetworkSettings.Networks)))
+		for netName, cfg := range inspect.NetworkSettings.Networks {
+			sb.WriteString(fmt.Sprintf("  * %s: IP=%s, Gateway=%s, MAC=%s\n",
+				netName, cfg.IPAddress, cfg.Gateway, cfg.MacAddress))
+			if len(cfg.Aliases) > 0 {
+				sb.WriteString(fmt.Sprintf("    Aliases: %s\n", strings.Join(cfg.Aliases, ", ")))
+			}
+		}
+	}
+
+	if inspect.NetworkSettings != nil && len(inspect.NetworkSettings.Ports) > 0 {
+		sb.WriteString("- Port Bindings:\n")
+		for port, bindings := range inspect.NetworkSettings.Ports {
+			if len(bindings) == 0 {
+				sb.WriteString(fmt.Sprintf("  * %s (exposed, not published)\n", port))
+				continue
+			}
+			for _, b := range bindings {
+				host := b.HostIP
+				if host == "" {
+					host = "0.0.0.0"
+				}
+				sb.WriteString(fmt.Sprintf("  * %s → %s:%s\n", port, host, b.HostPort))
+			}
+		}
+	}
+
+	if len(inspect.HostConfig.DNS) > 0 {
+		sb.WriteString(fmt.Sprintf("- DNS Overrides: %s\n", strings.Join(inspect.HostConfig.DNS, ", ")))
+	}
+
+	return sb.String()
 }
 
-// CheckConfig simulates a configuration validation check.
+// CheckConfig returns the container's real launch configuration via docker
+// inspect: image, entrypoint, command, working dir, user, environment
+// variables (with secret redaction), mounts, labels, and restart policy.
 func CheckConfig(containerID string) string {
-	return "CONFIG ANALYSIS: Found /etc/nginx/nginx.conf. Syntax is OK. No conflicting upstream rules detected."
+	cli, err := docker.Get()
+	if err != nil {
+		return fmt.Sprintf("CONFIG ANALYSIS: docker client unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+
+	inspect, err := cli.ContainerInspect(ctx, containerID)
+	if err != nil {
+		return fmt.Sprintf("CONFIG ANALYSIS: inspect failed: %v", err)
+	}
+
+	var sb strings.Builder
+	name := strings.TrimPrefix(inspect.Name, "/")
+	sb.WriteString(fmt.Sprintf("CONFIG ANALYSIS for %s:\n", name))
+	sb.WriteString(fmt.Sprintf("- Image: %s\n", inspect.Config.Image))
+
+	if len(inspect.Config.Entrypoint) > 0 {
+		sb.WriteString(fmt.Sprintf("- Entrypoint: %v\n", inspect.Config.Entrypoint))
+	}
+	if len(inspect.Config.Cmd) > 0 {
+		sb.WriteString(fmt.Sprintf("- Cmd: %v\n", inspect.Config.Cmd))
+	}
+	if inspect.Config.WorkingDir != "" {
+		sb.WriteString(fmt.Sprintf("- Working Dir: %s\n", inspect.Config.WorkingDir))
+	}
+	user := inspect.Config.User
+	if user == "" {
+		user = "root (default)"
+	}
+	sb.WriteString(fmt.Sprintf("- User: %s\n", user))
+
+	if len(inspect.Config.Env) > 0 {
+		sb.WriteString("- Environment:\n")
+		for _, e := range inspect.Config.Env {
+			sb.WriteString("  * " + redactSecret(e) + "\n")
+		}
+	}
+
+	if len(inspect.Mounts) > 0 {
+		sb.WriteString("- Mounts:\n")
+		for _, m := range inspect.Mounts {
+			sb.WriteString(fmt.Sprintf("  * %s → %s (%s, %s)\n",
+				m.Source, m.Destination, m.Type, m.Mode))
+		}
+	}
+
+	if len(inspect.Config.Labels) > 0 {
+		sb.WriteString("- Labels:\n")
+		for k, v := range inspect.Config.Labels {
+			sb.WriteString(fmt.Sprintf("  * %s=%s\n", k, v))
+		}
+	}
+
+	rp := inspect.HostConfig.RestartPolicy
+	sb.WriteString(fmt.Sprintf("- Restart Policy: %s (max retries: %d)\n",
+		rp.Name, rp.MaximumRetryCount))
+
+	return sb.String()
+}
+
+// redactSecret masks values for env vars whose names suggest credentials. The
+// log-and-prompt pipeline forwards these to the AI and Telegram, so leaking a
+// raw password into the chat would be a real incident.
+func redactSecret(envVar string) string {
+	parts := strings.SplitN(envVar, "=", 2)
+	if len(parts) != 2 {
+		return envVar
+	}
+	upper := strings.ToUpper(parts[0])
+	sensitive := []string{"PASSWORD", "SECRET", "TOKEN", "API_KEY", "PRIVATE", "CREDENTIAL"}
+	for _, needle := range sensitive {
+		if strings.Contains(upper, needle) {
+			return parts[0] + "=***REDACTED***"
+		}
+	}
+	return envVar
 }
