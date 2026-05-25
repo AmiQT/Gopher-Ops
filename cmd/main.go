@@ -19,6 +19,7 @@ import (
 	"gopher-ops/pkg/ai"
 	"gopher-ops/pkg/audit"
 	"gopher-ops/pkg/health"
+	"gopher-ops/pkg/k8s"
 	"gopher-ops/pkg/metrics"
 	"gopher-ops/pkg/monitor"
 	"gopher-ops/pkg/notify"
@@ -357,11 +358,15 @@ func main() {
 						"/start - Mula sembang\n" +
 						"/help - Tengok ni\n" +
 						"/status - Bot & AI status\n" +
-						"/containers - List semua containers\n" +
+						"/containers - List semua Docker containers\n" +
 						"/metrics - Live host CPU/RAM stats\n" +
 						"/alerts - Active alert state\n" +
 						"/disk - Disk usage per mount\n" +
-						"/reset - Clear in-memory state"
+						"/k8s - Kubernetes cluster info\n" +
+						"/reset - Clear in-memory state\n\n" +
+						"**Inline commands:**\n" +
+						"`update <ctr> cpu <cores> mem <mb>` - Adjust resources\n" +
+						"`search <ctr> <pattern>` - Grep container logs"
 				case "status":
 					health, _ := monitor.GetSystemHealth()
 					provider := os.Getenv("LLM_PROVIDER")
@@ -436,6 +441,17 @@ func main() {
 					}
 				case "disk":
 					msgText = monitor.FormatDiskUsage()
+				case "k8s":
+					if !k8s.Available() {
+						msgText = "⚠️ kubectl not found on PATH — install kubectl to use Kubernetes features.\n\nFor now, Kubernetes ops are available via MCP (mcp-server-kubernetes)."
+					} else {
+						info, err := k8s.GetClusterInfo()
+						if err != nil {
+							msgText = fmt.Sprintf("❌ k8s error: %v", err)
+						} else {
+							msgText = "☸️ **KUBERNETES CLUSTER**\n\n" + info
+						}
+					}
 				case "reset":
 					os.Remove(stateFile)
 					select {
@@ -460,6 +476,56 @@ func main() {
 				msg.ParseMode = "Markdown"
 				safeSend(bot, msg)
 				continue
+			}
+
+			// "update <container> cpu <cores> mem <mb>" — adjust resources inline.
+			// Example: update nginx cpu 0.5 mem 512
+			if strings.HasPrefix(strings.ToLower(input), "update ") {
+				parts := strings.Fields(input)
+				if len(parts) >= 6 {
+					ctrID := parts[1]
+					var cpuCores float64
+					var memMB int64
+					for i := 2; i+1 < len(parts); i++ {
+						switch strings.ToLower(parts[i]) {
+						case "cpu":
+							cpuCores, _ = strconv.ParseFloat(parts[i+1], 64)
+						case "mem", "memory":
+							memMB, _ = strconv.ParseInt(parts[i+1], 10, 64)
+						}
+					}
+					result, err := actions.UpdateContainerResources(ctrID, cpuCores, memMB)
+					var txt string
+					if err != nil {
+						txt = fmt.Sprintf("❌ Update failed: %v", err)
+					} else {
+						audit.Log(audit.Event{Type: "action", Actor: "user", Action: "update_resources", Target: ctrID, Status: "ok"})
+						txt = result
+					}
+					msg := tgbotapi.NewMessage(update.Message.Chat.ID, txt)
+					safeSend(bot, msg)
+					continue
+				}
+			}
+
+			// "search <container> <pattern>" — grep logs inline.
+			// Example: search nginx error
+			if strings.HasPrefix(strings.ToLower(input), "search ") {
+				parts := strings.SplitN(input, " ", 3)
+				if len(parts) == 3 {
+					ctrID, pattern := parts[1], parts[2]
+					result, err := actions.SearchLogs(ctrID, pattern, 500, 20)
+					var txt string
+					if err != nil {
+						txt = fmt.Sprintf("❌ Search failed: %v", err)
+					} else {
+						txt = result
+					}
+					msg := tgbotapi.NewMessage(update.Message.Chat.ID, txt)
+					msg.ParseMode = "Markdown"
+					safeSend(bot, msg)
+					continue
+				}
 			}
 
 			msgLoader := tgbotapi.NewMessage(update.Message.Chat.ID, "🧠 Gopher-Ops is thinking...")
@@ -515,6 +581,16 @@ func main() {
 						btnText = "📦 Live Container Stats"
 					case "DiskUsage":
 						btnText = "💾 Show Disk Usage"
+					case "UpdateResources":
+						btnText = "⚙️ Update Resources " + targetName
+					case "SearchLogs":
+						btnText = "🔎 Search Logs " + targetName
+					case "K8sListPods":
+						btnText = "☸️ List Pods"
+					case "K8sDescribePod":
+						btnText = "☸️ Describe Pod " + targetName
+					case "K8sRestartDeployment":
+						btnText = "☸️ Restart Deployment " + targetName
 					case "InvestigateNetwork":
 						btnText = "🌐 Triage: Network " + targetName
 					case "CheckConfig":
@@ -664,6 +740,35 @@ func handleCallbackQuery(bot *tgbotapi.BotAPI, agent ai.AIAgent, callback *tgbot
 		resMsg = monitor.FormatContainerStats()
 	case "DiskUsage":
 		resMsg = monitor.FormatDiskUsage()
+	case "UpdateResources":
+		// Callback data format: "UpdateResources:<id>:<cpuCores>:<memMB>"
+		// When triggered from a button, parts may be encoded in the target field.
+		// For now surface a prompt — actual values come from AI intent or follow-up.
+		resMsg = fmt.Sprintf("⚙️ **Update Resources: `%s`**\n\nHantar arahan dalam format:\n`update <container> cpu <cores> mem <mb>`\n\nContoh: `update nginx cpu 0.5 mem 512`", safeMD(target))
+	case "SearchLogs":
+		resMsg = fmt.Sprintf("🔎 **Search Logs: `%s`**\n\nHantar pattern yang nak cari:\n`search <container> <pattern>`\n\nContoh: `search nginx error`", safeMD(target))
+	case "K8sListPods":
+		out, err := k8s.ListPods("")
+		if err != nil {
+			resMsg = fmt.Sprintf("❌ k8s error: %v", err)
+		} else {
+			resMsg = "☸️ **PODS**\n\n" + out
+		}
+	case "K8sDescribePod":
+		out, err := k8s.DescribePod("", target)
+		if err != nil {
+			resMsg = fmt.Sprintf("❌ k8s error: %v", err)
+		} else {
+			resMsg = out
+		}
+	case "K8sRestartDeployment":
+		out, err := k8s.RestartDeployment("", target)
+		if err != nil {
+			resMsg = fmt.Sprintf("❌ k8s error: %v", err)
+		} else {
+			auditAction("K8sRestartDeployment", target, nil)
+			resMsg = out
+		}
 	default:
 		resMsg = "Action tak jumpa wtf ahaha"
 	}

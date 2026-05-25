@@ -66,6 +66,46 @@ func StopContainer(containerID string) (string, error) {
 	return fmt.Sprintf("Successfully stopped container %s", containerID), nil
 }
 
+// UpdateContainerResources adjusts the CPU and/or memory limit of a running
+// container without restarting it (docker update). Either value can be 0 to
+// leave it unchanged.
+//
+//   - cpuCores: new CPU quota in cores (e.g. 0.5 = half a core). Converted
+//     internally to NanoCPUs (1 core = 1e9 NanoCPUs).
+//   - memoryMB: new memory hard-limit in MB. Converted to bytes.
+//
+// This is intentionally gated behind AI_DESTRUCTIVE_ALLOWED or a HITL button
+// in the caller — callers must check authorisation before invoking.
+func UpdateContainerResources(containerID string, cpuCores float64, memoryMB int64) (string, error) {
+	cli, err := docker.Get()
+	if err != nil {
+		return "", fmt.Errorf("failed to get docker client: %w", err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), dockerTimeout)
+	defer cancel()
+
+	update := container.UpdateConfig{}
+	var parts []string
+
+	if cpuCores > 0 {
+		update.NanoCPUs = int64(cpuCores * 1e9)
+		parts = append(parts, fmt.Sprintf("CPU → %.2f cores", cpuCores))
+	}
+	if memoryMB > 0 {
+		update.Memory = memoryMB * 1024 * 1024
+		parts = append(parts, fmt.Sprintf("RAM → %d MB", memoryMB))
+	}
+	if len(parts) == 0 {
+		return "", fmt.Errorf("nothing to update: provide cpuCores > 0 or memoryMB > 0")
+	}
+
+	if _, err := cli.ContainerUpdate(ctx, containerID, update); err != nil {
+		return "", fmt.Errorf("failed to update resources for %s: %w", containerID, err)
+	}
+	return fmt.Sprintf("✅ Updated %s: %s", containerID, strings.Join(parts, ", ")), nil
+}
+
 // ClearCache is intentionally NOT implemented — cache clearing is highly
 // environment-specific (Redis FLUSHALL? OS page cache? application-level?)
 // and silently pretending to succeed would be dishonest. The diagnostic
@@ -113,6 +153,51 @@ func GetContainerLogsN(containerID string, lines int) (string, error) {
 	}
 
 	return buf.String(), nil
+}
+
+// SearchLogs fetches the last `tailLines` log lines for a container and returns
+// only lines that match the given pattern (case-insensitive substring match).
+// Returns at most maxResults matching lines to keep Telegram messages bounded.
+// The AI can call this directly during investigation to surface specific errors.
+func SearchLogs(containerID, pattern string, tailLines, maxResults int) (string, error) {
+	if tailLines <= 0 {
+		tailLines = 500
+	}
+	if maxResults <= 0 {
+		maxResults = 20
+	}
+
+	raw, err := GetContainerLogsN(containerID, tailLines)
+	if err != nil {
+		return "", err
+	}
+
+	patLower := strings.ToLower(pattern)
+	var matched []string
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.Contains(strings.ToLower(line), patLower) {
+			matched = append(matched, strings.TrimSpace(line))
+			if len(matched) >= maxResults {
+				break
+			}
+		}
+	}
+
+	if len(matched) == 0 {
+		return fmt.Sprintf("_(no matches for %q in last %d log lines)_", pattern, tailLines), nil
+	}
+
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("🔎 **%d match(es)** for `%s` in `%s`:\n\n", len(matched), pattern, containerID))
+	sb.WriteString("```\n")
+	for _, l := range matched {
+		if len(l) > 200 {
+			l = l[:197] + "..."
+		}
+		sb.WriteString(l + "\n")
+	}
+	sb.WriteString("```")
+	return sb.String(), nil
 }
 
 // InvestigateNetwork returns the container's real network configuration via
