@@ -15,7 +15,7 @@ make run                   # launch locally (requires Docker socket)
 
 ## Prerequisites
 
-- **Go 1.22+** (`go version`)
+- **Go 1.22+** (`go version`) — the exact required version is pinned in [go.mod](go.mod); use that or newer.
 - **Docker** running locally — many tests + the bot itself talk to the Docker socket
 - **Terraform 1.5+** — only needed if you touch `terraform/`
 - **kubectl** — only needed for the Kubernetes feature path

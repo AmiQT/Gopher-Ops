@@ -5,7 +5,8 @@
 # by `docker buildx build --platform linux/amd64,linux/arm64`.
 
 # ---------- builder ----------
-FROM --platform=$BUILDPLATFORM golang:1.22-alpine AS builder
+# Pin to a Go version >= the one in go.mod (currently 1.26.x). Bump on go.mod change.
+FROM --platform=$BUILDPLATFORM golang:1.26-alpine AS builder
 
 # Cache module downloads in a layer of their own.
 WORKDIR /src

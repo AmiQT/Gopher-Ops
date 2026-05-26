@@ -19,7 +19,8 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: "1.22"
+          # Read the version from go.mod — never drift between local + CI.
+          go-version-file: go.mod
           cache: true
 
       - name: Verify go.mod tidy
