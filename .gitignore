@@ -11,7 +11,11 @@
 !.env.example
 state.json
 state.json.tmp
+snooze.json
+snooze.json.tmp
 audit.log
+audit.log.*
+coverage.out
 
 # Binaries
 gopher-ops
@@ -23,6 +27,11 @@ go.work
 # OS-specific files
 .DS_Store
 Thumbs.db
+
+# Editor / agent workspaces (local-only)
+.claude/
+.idea/
+.vscode/
 
 # -----------------
 # TERRAFORM SECRETS

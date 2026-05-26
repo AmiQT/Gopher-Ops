@@ -400,3 +400,7 @@ func (a *GeminiAgent) Close() {
 	}
 }
 
+// IsOffline always returns false for GeminiAgent — the FallbackAgent wrapper
+// is what tracks degraded state. Provided so GeminiAgent satisfies AIAgent.
+func (a *GeminiAgent) IsOffline() bool { return false }
+

@@ -100,6 +100,10 @@ func (a *LocalAgent) Close() {
 	// No specific cleanup needed for the openai client
 }
 
+// IsOffline always returns false for LocalAgent — the FallbackAgent wrapper
+// is what tracks degraded state. Provided so LocalAgent satisfies AIAgent.
+func (a *LocalAgent) IsOffline() bool { return false }
+
 // DiagnoseIssue performs deep root-cause analysis via the local LLM. The
 // `evidence` argument should already contain the inspect post-mortem, recent
 // system metrics, and the log tail.

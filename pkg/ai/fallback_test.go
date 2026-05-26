@@ -26,6 +26,7 @@ func (s *stubAgent) DiagnoseIssue(name, ev string) (string, error)          { re
 func (s *stubAgent) AuditSecurity(ctx, img string) (string, error)          { return "audit", nil }
 func (s *stubAgent) TriageIssue(n, t, d string) (string, error)             { return "triage", nil }
 func (s *stubAgent) Close()                                                  {}
+func (s *stubAgent) IsOffline() bool                                         { return false }
 
 func TestFallbackAgent_PassthroughOnSuccess(t *testing.T) {
 	stub := &stubAgent{}

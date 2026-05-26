@@ -19,6 +19,10 @@ type AIAgent interface {
 
 	// Close cleans up any resources
 	Close()
+	// IsOffline reports whether the agent is currently degraded/offline.
+	// Inner agents (Gemini, Local) always return false; FallbackAgent
+	// returns true when consecutive failures have flipped it to fallback mode.
+	IsOffline() bool
 }
 
 // Config holds the configuration for the AI agents
