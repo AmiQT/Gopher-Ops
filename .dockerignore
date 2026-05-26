@@ -1,0 +1,49 @@
+# Keep the build context lean — Docker copies the working dir into the
+# builder otherwise. Excludes secrets, local state, and dev artifacts.
+
+# VCS + IDE
+.git
+.gitignore
+.github
+.idea
+.vscode
+.claude
+
+# Local state / outputs
+*.log
+state.json
+snooze.json
+audit.log
+audit.log.*
+coverage.out
+gopher-ops              # local binary
+*.exe
+
+# Local secrets
+.env
+
+# Docs (not needed in the image)
+*.md
+RESUME_CONTEXT.md
+TERRAFORM_NOTES.md
+
+# Infra-as-code (separate concern)
+terraform/
+*.tfstate
+*.tfstate.*
+.terraform/
+.terraform.lock.hcl
+
+# Tests + tooling configs (optional — keep image small)
+**/*_test.go
+.golangci.yml
+Makefile
+
+# Assets (screenshots etc.)
+assets/
+
+# Docker meta
+Dockerfile
+.dockerignore
+docker-compose.yml
+docker-compose.*.yml

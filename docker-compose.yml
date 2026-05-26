@@ -1,0 +1,46 @@
+# Gopher-Ops one-shot deploy.
+#
+# Usage:
+#   cp .env.example .env   # fill in TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, AUTHORIZED_CHAT_IDS
+#   docker compose up -d
+#   docker compose logs -f gopher-ops
+#
+# This mounts the host Docker socket so the bot can manage other containers.
+# That's a privileged action — only run on a host you control.
+
+services:
+  gopher-ops:
+    image: ghcr.io/yourusername/gopher-ops:latest
+    # Or build locally:
+    # build: .
+    container_name: gopher-ops
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      # Defaults that make sense in a container deployment. Override in .env
+      # if your setup differs.
+      HEALTH_PORT: "8080"
+      AUDIT_LOG_PATH: "/data/audit.log"
+    volumes:
+      # Docker socket — REQUIRED for the bot to manage containers.
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Persistent state: state.json, snooze.json, audit.log + rotations.
+      - gopher_data:/data
+    ports:
+      # Expose health + Prometheus metrics on localhost only by default. Drop
+      # the "127.0.0.1:" prefix to publish on all interfaces.
+      - "127.0.0.1:8080:8080"
+    # No built-in healthcheck — the distroless image has no shell or curl.
+    # Scrape http://<host>:8080/health from an external uptime monitor
+    # (e.g. Uptime Kuma, Pingdom, your Prometheus alertmanager).
+    # Security hardening
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+
+volumes:
+  gopher_data:

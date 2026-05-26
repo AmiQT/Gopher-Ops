@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"log/slog"
 	"net/http"
+	"net/http/pprof"
 	"time"
 
 	"gopher-ops/pkg/metrics"
@@ -31,11 +32,12 @@ type SubsystemProber func(ctx context.Context) SubsystemStatus
 
 // Server is the HTTP health + metrics endpoint.
 type Server struct {
-	port      string
-	startTime time.Time
-	version   string
-	probers   map[string]SubsystemProber
-	srv       *http.Server
+	port        string
+	startTime   time.Time
+	version     string
+	probers     map[string]SubsystemProber
+	srv         *http.Server
+	enablePprof bool
 }
 
 func New(port, version string) *Server {
@@ -46,6 +48,11 @@ func New(port, version string) *Server {
 		probers:   make(map[string]SubsystemProber),
 	}
 }
+
+// EnablePprof exposes Go's net/http/pprof handlers under /debug/pprof/. Off by
+// default — only enable when actively profiling, since the endpoint leaks
+// internal state and can be expensive to scrape.
+func (s *Server) EnablePprof() { s.enablePprof = true }
 
 // AddProber registers a named subsystem health check.
 func (s *Server) AddProber(name string, fn SubsystemProber) {
@@ -59,6 +66,15 @@ func (s *Server) Start(ctx context.Context) {
 	mux.HandleFunc("/health", s.handleHealth)
 	mux.Handle("/metrics", metrics.Handler())
 	mux.HandleFunc("/", s.handleHealth)
+
+	if s.enablePprof {
+		mux.HandleFunc("/debug/pprof/", pprof.Index)
+		mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
+		mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
+		mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
+		mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
+		slog.Warn("⚠️  pprof enabled at /debug/pprof/ — do not expose publicly")
+	}
 
 	s.srv = &http.Server{
 		Addr:              ":" + s.port,
