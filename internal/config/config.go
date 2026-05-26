@@ -101,10 +101,6 @@ func Load() (*Config, error) {
 	c.AuthorizedChatIDs = ids
 	c.AuthorizedSet = set
 
-	if c.LLMProvider == "local" && c.LocalLLMAPIKey != "" {
-		// local provider repurposes APIKey for the local endpoint key
-	}
-
 	if err := c.Validate(); err != nil {
 		return nil, err
 	}

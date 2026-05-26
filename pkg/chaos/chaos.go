@@ -3,9 +3,9 @@
 // never fire accidentally in production.
 //
 // Chaos mode is NOT autopilot — it is a deliberate test tool that:
-//   1. Picks a running container at random (or a named one).
-//   2. Stops it to simulate a crash.
-//   3. Reports back so the bot operator can watch the self-healing loop.
+//  1. Picks a running container at random (or a named one).
+//  2. Stops it to simulate a crash.
+//  3. Reports back so the bot operator can watch the self-healing loop.
 //
 // Use case: verify that alerting + autopilot restart works end-to-end
 // without manufacturing a real failure.

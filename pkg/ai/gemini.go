@@ -393,7 +393,8 @@ func (a *GeminiAgent) extractText(resp *genai.GenerateContentResponse) string {
 // Close cleans up
 func (a *GeminiAgent) Close() {
 	if a.client != nil {
-		a.client.Close()
+		// Close error has no recovery path during shutdown; just drop it.
+		_ = a.client.Close()
 	}
 	if a.mcpManager != nil {
 		a.mcpManager.Close()

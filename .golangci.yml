@@ -32,9 +32,10 @@ linters:
 
   settings:
     errcheck:
-      # `defer f.Close()` and `bot.Request` returning errors are intentional —
-      # we already log inside SafeSend, and Close errors on a read-only file
-      # have no recovery path. Skip these well-known false-positive sources.
+      # Functions whose return errors have no recovery path or are already
+      # logged inside a wrapper. SafeSend logs + counts internally — callers
+      # don't need to handle the error again. Close on read-only file
+      # handles has no recovery path during deferred cleanup.
       exclude-functions:
         - (io.Closer).Close
         - (*os.File).Close
@@ -42,6 +43,7 @@ linters:
         - os.Remove
         - encoding/json.Unmarshal
         - (*github.com/go-telegram-bot-api/telegram-bot-api/v5.BotAPI).Request
+        - (*gopher-ops/internal/bot.Deps).SafeSend
 
     staticcheck:
       # Disable the style-only "QF" quick-fix checks. They suggest

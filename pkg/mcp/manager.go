@@ -77,6 +77,7 @@ func (m *MCPManager) CallTool(ctx context.Context, name string, args map[string]
 // Close shuts down the MCP server connection
 func (m *MCPManager) Close() {
 	if m.mcpClient != nil {
-		m.mcpClient.Close()
+		// Close error has no recovery path during shutdown; just drop it.
+		_ = m.mcpClient.Close()
 	}
 }
