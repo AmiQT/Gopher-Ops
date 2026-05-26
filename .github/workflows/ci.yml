@@ -37,7 +37,9 @@ jobs:
       - name: Lint
         uses: golangci/golangci-lint-action@v6
         with:
-          version: latest
+          # Pin to a specific minor — "latest" caused breakage when golangci-lint
+          # v2 shipped with a breaking config format. Bump deliberately.
+          version: v2.12.2
           args: --timeout=5m
 
       - name: Unit tests

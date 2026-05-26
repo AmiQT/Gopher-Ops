@@ -1,8 +1,11 @@
-# golangci-lint config. Strict but pragmatic — flags real bugs without
+# golangci-lint v2 config. Strict but pragmatic — flags real bugs without
 # drowning contributors in style noise.
 #
 # Run: `make lint`
 # Docs: https://golangci-lint.run/usage/configuration/
+# v2 migration: https://golangci-lint.run/product/migration-guide/
+
+version: "2"
 
 run:
   timeout: 5m
@@ -11,14 +14,14 @@ run:
     - integration
 
 linters:
-  disable-all: true
+  default: none
   enable:
     # Bug-catchers
     - errcheck         # unchecked errors
     - gosec            # security issues
     - govet            # suspicious constructs
     - ineffassign      # ineffective assignments
-    - staticcheck      # broad static analysis
+    - staticcheck      # broad static analysis (now includes stylecheck + gosimple in v2)
     - unused           # unused code
     - bodyclose        # http.Response.Body left open
     - nilerr           # returning nil after non-nil error check
@@ -33,42 +36,42 @@ linters:
     - unconvert        # redundant type conversions
     - unparam          # unused function parameters
 
-    # Style (light touch)
+  settings:
+    gosec:
+      excludes:
+        - G104  # already covered by errcheck
+        - G304  # file path provided as variable — needed for plugin paths
+
+    revive:
+      rules:
+        - name: exported
+          disabled: true   # too noisy for internal packages
+        - name: unused-parameter
+          disabled: true   # unparam handles this better
+
+    gocritic:
+      disabled-checks:
+        - ifElseChain      # often unavoidable in switch-like dispatch
+        - hugeParam        # we knowingly pass some big structs by value
+
+    misspell:
+      locale: US
+
+  exclusions:
+    # Tests can be more relaxed
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+          - gosec
+          - unparam
+
+# In v2, formatters (gofmt, goimports) are separate from linters.
+formatters:
+  enable:
     - gofmt
     - goimports
 
-linters-settings:
-  gosec:
-    excludes:
-      - G104  # already covered by errcheck
-      - G304  # file path provided as variable — needed for plugin paths
-
-  revive:
-    rules:
-      - name: exported
-        disabled: true   # too noisy for internal packages
-      - name: unused-parameter
-        disabled: true   # unparam handles this better
-
-  gocritic:
-    disabled-checks:
-      - ifElseChain      # often unavoidable in switch-like dispatch
-      - hugeParam        # we knowingly pass some big structs by value
-
-  misspell:
-    locale: US
-
 issues:
-  exclude-rules:
-    # Tests can be more relaxed
-    - path: _test\.go
-      linters:
-        - errcheck
-        - gosec
-        - unparam
-    # Generated/legacy main.go bits — none currently
-  exclude-dirs:
-    - terraform
-    - assets
   max-issues-per-linter: 0
   max-same-issues: 0
