@@ -34,8 +34,8 @@ func TestHandleUpdate_ParsesValidInput(t *testing.T) {
 
 func TestHandleSearch_RequiresThreeParts(t *testing.T) {
 	cases := []string{
-		"search",         // missing both
-		"search nginx",   // missing pattern
+		"search",       // missing both
+		"search nginx", // missing pattern
 	}
 	for _, in := range cases {
 		_, handled := handleSearch(in)

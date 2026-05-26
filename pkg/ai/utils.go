@@ -37,7 +37,7 @@ func ExtractIntents(output string) []ActionIntent {
 	if clearCacheRe.MatchString(output) {
 		intents = append(intents, ActionIntent{Action: "ClearCache", Target: ""})
 	}
-	
+
 	// VIEW LOGS
 	logsRe := regexp.MustCompile(`ViewLogs\(['"]?([a-zA-Z0-9]+)['"]?\)`)
 	for _, matches := range logsRe.FindAllStringSubmatch(output, -1) {

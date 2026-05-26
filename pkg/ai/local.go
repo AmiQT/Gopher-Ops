@@ -23,7 +23,7 @@ func NewLocalAgent(cfg Config) (*LocalAgent, error) {
 	if cfg.BaseURL != "" {
 		config.BaseURL = cfg.BaseURL
 	}
-	
+
 	client := openai.NewClientWithConfig(config)
 
 	agent := &LocalAgent{
@@ -50,7 +50,7 @@ func (a *LocalAgent) ProcessRequest(userMsg string) (string, []ActionIntent, err
 
 	// Create enriched prompt
 	enrichedPrompt := fmt.Sprintf("```\n%s\n```\nOperator Query: %s", health, userMsg)
-	
+
 	// Add user message to history
 	a.history = append(a.history, openai.ChatCompletionMessage{
 		Role:    openai.ChatMessageRoleUser,
@@ -197,4 +197,3 @@ func (a *LocalAgent) TriageIssue(containerName, triageType, data string) (string
 	}
 	return resp.Choices[0].Message.Content, nil
 }
-

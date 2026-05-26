@@ -64,7 +64,7 @@ func NewGeminiAgent(apiKey, modelType string) (*GeminiAgent, error) {
 	}
 
 	if modelType == "" {
-		modelType = "gemini-2.5-flash" 
+		modelType = "gemini-2.5-flash"
 	}
 	model := client.GenerativeModel(modelType)
 	model.SetTemperature(0.7)
@@ -82,7 +82,7 @@ func NewGeminiAgent(apiKey, modelType string) (*GeminiAgent, error) {
 
 	// 2. Register Tools
 	var toolList []*genai.FunctionDeclaration
-	
+
 	// Add Local Tools
 	toolList = append(toolList, GetLocalTools()...)
 
@@ -103,7 +103,7 @@ func NewGeminiAgent(apiKey, modelType string) (*GeminiAgent, error) {
 	model.Tools = []*genai.Tool{
 		{FunctionDeclarations: toolList},
 	}
-	
+
 	session := model.StartChat()
 
 	return &GeminiAgent{
@@ -116,7 +116,7 @@ func NewGeminiAgent(apiKey, modelType string) (*GeminiAgent, error) {
 
 // ConvertMCPSchemaToGenai is a helper to bridge MCP JSON Schema to Gemini Schema
 func ConvertMCPSchemaToGenai(mcpSchema interface{}) *genai.Schema {
-	// For now, we perform a basic mapping. 
+	// For now, we perform a basic mapping.
 	// We convert the struct to a map first for easier processing.
 	var schemaMap map[string]interface{}
 	// mcp.ToolInputSchema should be marshalable
@@ -125,7 +125,7 @@ func ConvertMCPSchemaToGenai(mcpSchema interface{}) *genai.Schema {
 	json.Unmarshal(data, &schemaMap)
 
 	schema := &genai.Schema{
-		Type: genai.TypeObject,
+		Type:       genai.TypeObject,
 		Properties: make(map[string]*genai.Schema),
 	}
 
@@ -133,7 +133,7 @@ func ConvertMCPSchemaToGenai(mcpSchema interface{}) *genai.Schema {
 		for name, p := range props {
 			pMap := p.(map[string]interface{})
 			propSchema := &genai.Schema{}
-			
+
 			// Map types
 			switch pMap["type"].(string) {
 			case "string":
@@ -403,4 +403,3 @@ func (a *GeminiAgent) Close() {
 // IsOffline always returns false for GeminiAgent — the FallbackAgent wrapper
 // is what tracks degraded state. Provided so GeminiAgent satisfies AIAgent.
 func (a *GeminiAgent) IsOffline() bool { return false }
-

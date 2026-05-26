@@ -38,7 +38,7 @@ var chainHash string
 
 var (
 	mu       sync.Mutex
-	path     = "audit.log"
+	path           = "audit.log"
 	maxSize  int64 = 10 * 1024 * 1024 // 10 MB before rotation
 	maxFiles       = 5                // keep audit.log + audit.log.1..audit.log.5
 )
@@ -162,7 +162,7 @@ func Log(evt Event) {
 // VerifyResult is the outcome of a chain integrity check.
 type VerifyResult struct {
 	Entries  int
-	Broken   int    // index of first broken link (0-based), -1 if intact
+	Broken   int // index of first broken link (0-based), -1 if intact
 	ErrorMsg string
 }
 

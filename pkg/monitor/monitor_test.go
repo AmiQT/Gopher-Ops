@@ -25,7 +25,7 @@ func TestAsciiBar(t *testing.T) {
 		{50, 20, 10},
 		{100, 20, 20},
 		{105, 20, 20}, // clamp above 100
-		{-5, 20, 0},  // clamp below 0
+		{-5, 20, 0},   // clamp below 0
 	}
 	for _, c := range cases {
 		bar := asciiBar(c.pct)
@@ -83,7 +83,7 @@ func TestSumBlkioBytes(t *testing.T) {
 			{Op: "Read", Value: 1000},
 			{Op: "Write", Value: 2000},
 			{Op: "Read", Value: 500},
-			{Op: "Sync", Value: 9999}, // must be ignored
+			{Op: "Sync", Value: 9999},  // must be ignored
 			{Op: "Total", Value: 9999}, // must be ignored
 		},
 	}

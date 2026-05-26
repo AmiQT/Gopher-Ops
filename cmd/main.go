@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -27,6 +28,16 @@ import (
 )
 
 func main() {
+	if err := run(); err != nil {
+		slog.Error("fatal", "error", err)
+		os.Exit(1)
+	}
+}
+
+// run is the real entrypoint. We isolate it so deferred cleanups (signal
+// handler release, AI agent close) actually fire before process exit — a
+// bare `os.Exit(1)` from main() skips deferred calls (gocritic exitAfterDefer).
+func run() error {
 	slog.SetDefault(slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: slog.LevelInfo,
 	})))
@@ -40,8 +51,7 @@ func main() {
 
 	cfg, err := config.Load()
 	if err != nil {
-		slog.Error("config load failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("config load: %w", err)
 	}
 	slog.Info("Authorized operators configured", "count", len(cfg.AuthorizedChatIDs))
 
@@ -50,8 +60,7 @@ func main() {
 
 	deps, err := bot.Boot(ctx, cfg)
 	if err != nil {
-		slog.Error("boot failed", "error", err)
-		os.Exit(1)
+		return fmt.Errorf("boot: %w", err)
 	}
 	defer deps.Agent.Close()
 
@@ -60,6 +69,7 @@ func main() {
 	go runner.SuperviseMonitor(ctx, deps)
 
 	runUpdateLoop(ctx, deps, limiter)
+	return nil
 }
 
 // runUpdateLoop is the Telegram receive loop: dispatch callbacks, commands,

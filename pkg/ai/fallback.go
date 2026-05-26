@@ -14,8 +14,8 @@ import (
 // useful diagnostic data (system health, container states) without an LLM
 // round-trip. It exits offline mode automatically after a back-off window.
 type FallbackAgent struct {
-	inner       AIAgent
-	failures    atomic.Int32
+	inner        AIAgent
+	failures     atomic.Int32
 	offlineUntil atomic.Int64 // Unix nano; 0 = not offline
 }
 

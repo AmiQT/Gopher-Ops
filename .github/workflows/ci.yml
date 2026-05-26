@@ -35,10 +35,11 @@ jobs:
         run: go vet ./...
 
       - name: Lint
-        uses: golangci/golangci-lint-action@v6
+        uses: golangci/golangci-lint-action@v7
         with:
-          # Pin to a specific minor — "latest" caused breakage when golangci-lint
-          # v2 shipped with a breaking config format. Bump deliberately.
+          # v7+ is required for golangci-lint v2; v6 errors with
+          # "invalid version string". Pin lint version too so silent
+          # major bumps don't break the config schema.
           version: v2.12.2
           args: --timeout=5m
 

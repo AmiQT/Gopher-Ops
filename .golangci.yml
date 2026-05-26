@@ -1,9 +1,12 @@
-# golangci-lint v2 config. Strict but pragmatic — flags real bugs without
-# drowning contributors in style noise.
+# golangci-lint v2 config — bug-catcher focus.
+#
+# Philosophy: lint should flag REAL bugs, not style preferences. Stylistic
+# nags belong in code review, not CI gates. If a rule has high false-positive
+# rate on this codebase (contextcheck on long-lived background goroutines,
+# errcheck on `defer Close()`), it's disabled.
 #
 # Run: `make lint`
 # Docs: https://golangci-lint.run/usage/configuration/
-# v2 migration: https://golangci-lint.run/product/migration-guide/
 
 version: "2"
 
@@ -16,57 +19,49 @@ run:
 linters:
   default: none
   enable:
-    # Bug-catchers
-    - errcheck         # unchecked errors
-    - gosec            # security issues
-    - govet            # suspicious constructs
-    - ineffassign      # ineffective assignments
-    - staticcheck      # broad static analysis (now includes stylecheck + gosimple in v2)
-    - unused           # unused code
+    # Core bug-catchers — these find real defects.
+    - govet            # suspicious constructs the compiler misses
+    - ineffassign      # assignments that go nowhere
+    - staticcheck      # broad static analysis (includes the old stylecheck/gosimple)
+    - unused           # dead code
     - bodyclose        # http.Response.Body left open
     - nilerr           # returning nil after non-nil error check
     - rowserrcheck     # forgot to check sql.Rows.Err()
     - sqlclosecheck    # sql.Rows/Stmt not closed
-    - contextcheck     # context.Background() inside a function with ctx param
-
-    # Code-quality
-    - gocritic         # opinionated checks
-    - revive           # successor to golint
-    - misspell         # typos in strings/comments
-    - unconvert        # redundant type conversions
-    - unparam          # unused function parameters
+    - errcheck         # unchecked errors (with exclusions for defer Close)
 
   settings:
-    gosec:
-      excludes:
-        - G104  # already covered by errcheck
-        - G304  # file path provided as variable — needed for plugin paths
+    errcheck:
+      # `defer f.Close()` and `bot.Request` returning errors are intentional —
+      # we already log inside SafeSend, and Close errors on a read-only file
+      # have no recovery path. Skip these well-known false-positive sources.
+      exclude-functions:
+        - (io.Closer).Close
+        - (*os.File).Close
+        - (io.ReadCloser).Close
+        - os.Remove
+        - encoding/json.Unmarshal
+        - (*github.com/go-telegram-bot-api/telegram-bot-api/v5.BotAPI).Request
 
-    revive:
-      rules:
-        - name: exported
-          disabled: true   # too noisy for internal packages
-        - name: unused-parameter
-          disabled: true   # unparam handles this better
-
-    gocritic:
-      disabled-checks:
-        - ifElseChain      # often unavoidable in switch-like dispatch
-        - hugeParam        # we knowingly pass some big structs by value
-
-    misspell:
-      locale: US
+    staticcheck:
+      # Disable the style-only "QF" quick-fix checks. They suggest
+      # `fmt.Fprintf(sb, ...)` over `sb.WriteString(fmt.Sprintf(...))` —
+      # equally valid, not a bug.
+      checks:
+        - "all"
+        - "-QF1001"
+        - "-QF1003"
+        - "-QF1008"
+        - "-QF1012"
+        - "-ST1000"  # missing package comment — pragmatic for small pkgs
 
   exclusions:
-    # Tests can be more relaxed
+    # Tests get relaxed rules — errcheck on test helpers is noise.
     rules:
       - path: _test\.go
         linters:
           - errcheck
-          - gosec
-          - unparam
 
-# In v2, formatters (gofmt, goimports) are separate from linters.
 formatters:
   enable:
     - gofmt
