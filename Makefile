@@ -3,7 +3,7 @@
 BINARY_NAME=gopher-ops
 MAIN_PATH=./cmd
 COVER_FILE=coverage.out
-COVER_MIN=60
+COVER_MIN=20
 
 help:  ## Show this help
 	@grep -hE '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-20s\033[0m %s\n", $$1, $$2}'

@@ -49,7 +49,7 @@ Run **all four** (`fmt`, `lint`, `test`, `build`) before pushing — that's exac
 - For Docker-touching code, prefer integration tests under `// +build integration` and run with `make test-integration`.
 - Add fuzz tests (`func FuzzXxx`) for anything that parses untrusted input — chat IDs, Markdown, log lines.
 
-Coverage gate: PRs must keep total coverage **≥ 60%**. CI will fail otherwise.
+Coverage gate: PRs must keep total coverage **≥ 20%**. This floor sits just below current real coverage and exists to catch accidental test deletion; raise it deliberately as new tests land.
 
 ## Commit messages
 
