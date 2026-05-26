@@ -21,6 +21,9 @@ coverage.out
 gopher-ops
 gopher-ops.exe
 
+# Personal notes (kept local, not for public repo)
+RESUME_CONTEXT.md
+
 # Go workspace
 go.work
 
