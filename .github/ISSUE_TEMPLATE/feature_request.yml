@@ -1,0 +1,51 @@
+name: ✨ Feature Request
+description: Propose a new feature or enhancement
+title: "[feat]: "
+labels: ["enhancement", "triage"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the pain point — why does the current behavior fall short?
+      placeholder: "When my Redis cluster does X, I currently have to ..."
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: How would you like Gopher-Ops to behave?
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What other approaches have you thought about? Why are they worse?
+
+  - type: dropdown
+    id: scope
+    attributes:
+      label: Scope
+      description: Which area does this touch?
+      options:
+        - Telegram UX (new command/button)
+        - AI / RCA logic
+        - Monitoring / alerts
+        - Docker actions
+        - Kubernetes integration
+        - Audit / observability
+        - Config / deployment
+        - Other
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: contribution
+    attributes:
+      label: Contribution
+      options:
+        - label: I'm willing to submit a PR for this

@@ -63,33 +63,37 @@ graph TD;
 
 ## ⚙️ Setup & Deployment
 
-### 1. Configure the AI Bot (Go)
+### Option A: Docker (recommended — zero Go setup)
 
-Clone the repository and set up your credentials:
+```bash
+git clone https://github.com/yourusername/gopher-ops.git
+cd gopher-ops
+cp .env.example .env       # fill in TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, AUTHORIZED_CHAT_IDS
+docker compose up -d
+docker compose logs -f gopher-ops
+```
+
+The compose file pulls `ghcr.io/yourusername/gopher-ops:latest` (multi-arch: amd64 + arm64, runs on Pi too), mounts the host Docker socket, and persists `state.json` / `snooze.json` / `audit.log` in a named volume. Health + metrics are exposed at `http://localhost:8080/{health,metrics}`.
+
+To pin a version: edit `docker-compose.yml` and replace `:latest` with `:v1.2.3`.
+
+### Option B: Build from source (Go)
+
 ```bash
 git clone https://github.com/yourusername/gopher-ops.git
 cd gopher-ops
 cp .env.example .env
-go mod tidy
+make run                   # or: go run ./cmd
 ```
-**Important:** Update `.env` with your Gemini API key, Telegram Token, and your specific `AUTHORIZED_CHAT_ID`.
 
-### 2. Provision the Target Lab (Terraform)
+### Optional: Provision the demo lab (Terraform)
 
-Deploy the dummy microservices (Nginx & Redis) for the bot to monitor:
+The repo ships a Terraform module that spins up Nginx + a scaled Redis cluster for the bot to monitor:
+
 ```bash
 cd terraform
 terraform init
 terraform apply -auto-approve
-```
-*This will spin up `gopher-ops-nginx-lab` and scaled Redis nodes with persistent data volumes on a custom docker network.*
-
-### 3. Run Gopher-Ops
-
-Return to the root directory and boot up the SRE agent:
-```bash
-cd ..
-go run cmd/main.go
 ```
 
 ## ⚙️ Configuration
@@ -123,6 +127,7 @@ All runtime behaviour is driven through environment variables (loaded from `.env
 | `AUDIT_LOG_MAX_SIZE_MB` | `10` | Rotate audit log when it exceeds this many MB. |
 | `AUDIT_LOG_MAX_FILES` | `5` | Number of rotated audit files retained. |
 | `MONITOR_URLS` | _(empty)_ | Comma-separated URLs probed each minute for HTTP health. |
+| `PPROF_ENABLED` | `false` | Expose Go pprof handlers under `/debug/pprof/`. Profiling only — never expose publicly. |
 
 ## 🧠 Deep Root-Cause Analysis
 
@@ -145,6 +150,7 @@ Gopher-Ops is engineered to run unattended in production. Highlights:
 - **HITL-by-default safety mode** — the AI cannot directly execute `Stop`/`Restart` unless `AI_DESTRUCTIVE_ALLOWED=true`; otherwise it must route those through the operator's confirmation buttons.
 - **Markdown sanitization** — untrusted strings (container names, log payloads) are escaped before being rendered, so a hostile log line cannot break formatting or smuggle styling.
 - **Alert cooldown** — flapping containers won't spam the chat; repeat alerts for the same target are suppressed for `ALERT_COOLDOWN_MINUTES`.
+- **Per-alert snooze buttons** — every alert ships with `🤫 1h / 4h / 24h` buttons. Tap to suppress that specific alert key (container, disk mount, log pattern, sustained CPU). Snoozes persist across restarts in `snooze.json` and auto-expire.
 - **Bounded RCA cache** — entries older than 1 hour, or referring to containers that no longer exist, are evicted each tick.
 - **Structured logging** — Go's `log/slog` emits key-value fields (container ID, action, error) suitable for log aggregators.
 - **Graceful shutdown** — `SIGINT` / `SIGTERM` cancel the update loop and stop the background monitor cleanly.
@@ -211,6 +217,10 @@ Contributions are welcome! Whether it's fixing a bug, adding a new tool, or impr
 ## 📜 Credits & Acknowledgments
 
 The Kubernetes management capabilities of Gopher-Ops are powered by the **Model Context Protocol (MCP)** and the excellent [MCP Server Kubernetes](https://github.com/Flux159/mcp-server-kubernetes) community project. Special thanks to the authors for their work in bridging AI and Kubernetes.
+
+## 🔒 Security
+
+Found a vulnerability? **Do not open a public issue.** See [SECURITY.md](SECURITY.md) for our coordinated disclosure policy (private GitHub Security Advisory, 72h ack, 30-day patch SLA for high/critical).
 
 ## ⚠️ Disclaimer
 This project binds to the host's Docker socket and Kubernetes API to execute real infrastructure lifecycles. Please ensure your `AUTHORIZED_CHAT_ID` is strictly configured to prevent unauthorized manipulation.

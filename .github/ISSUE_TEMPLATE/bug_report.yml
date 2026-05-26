@@ -1,0 +1,85 @@
+name: 🐛 Bug Report
+description: Report something that's broken or misbehaving
+title: "[bug]: "
+labels: ["bug", "triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug report! Please fill out the details below.
+        **Do not include secrets** (bot tokens, API keys, chat IDs) in any field.
+
+  - type: input
+    id: version
+    attributes:
+      label: Gopher-Ops version
+      description: Run `/status` in Telegram or check `git rev-parse --short HEAD`
+      placeholder: "e.g. e58d45f"
+    validations:
+      required: true
+
+  - type: input
+    id: go-version
+    attributes:
+      label: Go version
+      description: Output of `go version`
+      placeholder: "go1.22.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating System
+      options:
+        - Linux
+        - macOS
+        - Windows
+        - Docker container
+    validations:
+      required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug
+      placeholder: When I run /chaos, the bot ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+      placeholder: I expected ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Set CHAOS_ENABLED=true
+        2. Send `/chaos` in Telegram
+        3. See error
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant log output
+      description: Paste relevant lines from `audit.log` or stderr. **Redact secrets.**
+      render: shell
+
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: Confirmation
+      options:
+        - label: I have searched existing issues and this is not a duplicate
+          required: true
+        - label: I have redacted all secrets (tokens, API keys, chat IDs)
+          required: true
