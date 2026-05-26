@@ -1,0 +1,38 @@
+# Dependabot keeps Go modules, GitHub Actions, and Terraform providers up to date.
+# Grouped updates keep PR noise low — one weekly PR per ecosystem.
+
+version: 2
+updates:
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      go-deps:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "deps"
+      include: "scope"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    groups:
+      ci-actions:
+        patterns:
+          - "*"
+    commit-message:
+      prefix: "ci"
+
+  - package-ecosystem: "terraform"
+    directory: "/terraform"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "tf"

@@ -2,29 +2,60 @@ name: Gopher-Ops CI Pipeline
 
 on:
   push:
-    branches: [ "main" ]
+    branches: ["main"]
   pull_request:
-    branches: [ "main" ]
+    branches: ["main"]
+
+permissions:
+  contents: read
 
 jobs:
-  go-tests:
-    name: Run Go Tests
+  test:
+    name: Build, Lint & Test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-          
+          go-version: "1.22"
+          cache: true
+
+      - name: Verify go.mod tidy
+        run: |
+          go mod tidy
+          git diff --exit-code go.mod go.sum
+
       - name: Build
         run: go build -v ./...
-        
-      - name: Run Unit Tests
-        run: go test -v ./...
 
-  terraform-checks:
+      - name: Vet
+        run: go vet ./...
+
+      - name: Lint
+        uses: golangci/golangci-lint-action@v6
+        with:
+          version: latest
+          args: --timeout=5m
+
+      - name: Unit tests
+        run: go test -race -timeout 120s -coverprofile=coverage.out -covermode=atomic ./...
+
+      - name: Coverage gate (≥ 60%)
+        run: |
+          COVERAGE=$(go tool cover -func=coverage.out | grep total | awk '{print substr($3, 1, length($3)-1)}')
+          echo "Total coverage: $COVERAGE%"
+          awk -v cov="$COVERAGE" 'BEGIN { if (cov+0 < 60) { print "❌ Coverage below 60%"; exit 1 } else { print "✅ Coverage OK" } }'
+
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.out
+
+  terraform:
     name: Terraform Validate
     runs-on: ubuntu-latest
     defaults:
@@ -32,15 +63,15 @@ jobs:
         working-directory: ./terraform
     steps:
       - uses: actions/checkout@v4
-      
+
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
-        
+
       - name: Terraform Init
-        run: terraform init
-        
+        run: terraform init -backend=false
+
       - name: Terraform Format Check
         run: terraform fmt -check
-        
+
       - name: Terraform Validate
         run: terraform validate
