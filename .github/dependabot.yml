@@ -13,6 +13,13 @@ updates:
       go-deps:
         patterns:
           - "*"
+    # Docker SDK ≥ v27 moved StatsJSON/BlkioStats/NetworkStats to the
+    # api/types/container subpackage, breaking our monitor code. Pin to
+    # v26.x until we do the migration deliberately. Bump manually when ready.
+    ignore:
+      - dependency-name: "github.com/docker/docker"
+        update-types:
+          - "version-update:semver-major"
     commit-message:
       prefix: "deps"
       include: "scope"
