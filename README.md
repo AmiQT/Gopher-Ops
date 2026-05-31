@@ -1,4 +1,4 @@
-# 🤖 Gopher-Ops: AI-Driven SRE ChatOps Platform
+# Gopher-Ops: AI-Driven SRE ChatOps Platform
 
 ![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)
 ![Docker](https://img.shields.io/badge/Docker-Supported-2496ED?style=flat&logo=docker)
@@ -10,7 +10,7 @@
 
 **Gopher-Ops** is a Secure AI SRE Telegram bot managing Docker, Kubernetes, and system metrics via natural language.
 
-## 🚀 Key Features
+## Key Features
 
 - **AI ChatOps:** Powered by **Google Gemini (2.0/2.5-flash)** to parse intents and logs, answering infrastructure queries in a casual persona to reduce operator cognitive load.
 - **Telemetry & Observability:** Real-time monitoring of host OS (CPU/RAM), Docker, and Kubernetes states via **gopsutil**, **Docker SDK**, and **MCP**. Includes a 1-hour in-memory metric history for sustained high-load detection and proactive alerting.
@@ -21,7 +21,7 @@
 - **Robust CI/CD Pipeline:** Configured with **GitHub Actions** for automated Go unit testing and Terraform validation/formatting upon every push/PR.
 - **Zero-Trust & DevSecOps:** Telegram Chat ID gating (supports multiple authorized operators) ensuring only authorized operators can execute commands. Includes **basic image vulnerability pattern-matching** against known-bad tags — integrate Trivy or Grype for real CVE coverage.
 
-## 🎮 Interactive Demo
+## Interactive Demo
 
 > **Self-Healing in Action:** Watch Gopher-Ops detect a crashed Redis node, analyze the root cause (RCA) via Gemini AI, and perform an automated restart.
 
@@ -33,7 +33,7 @@ https://github.com/user-attachments/assets/7f9d6055-ba37-4705-b883-1d394919bcf1
 
 
 
-## 🏗️ Architecture Workflow
+## Architecture Workflow
 
 ```mermaid
 graph TD;
@@ -45,7 +45,7 @@ graph TD;
     Docker --> Redis[Redis Cluster + Persistent Volume]
 ```
 
-## 🛠️ Tech Stack
+## Tech Stack
 
 - **Backend:** Go (Golang), Docker API SDK, gopsutil, **MCP Go SDK**
 - **AI / NLP:** Google Generative AI (Gemini 2.0 Flash)
@@ -53,7 +53,7 @@ graph TD;
 - **CI/CD:** GitHub Actions
 - **Interface:** Telegram Bot API
 
-## 📋 Prerequisites
+## Prerequisites
 
 - [Go 1.22+](https://go.dev/)
 - [Docker](https://www.docker.com/) running on the host machine.
@@ -61,7 +61,7 @@ graph TD;
 - A Telegram Bot Token (from [@BotFather](https://t.me/BotFather)).
 - A Google Gemini API Key.
 
-## ⚙️ Setup & Deployment
+## Setup & Deployment
 
 ### Option A: Docker (recommended — zero Go setup)
 
@@ -96,7 +96,7 @@ terraform init
 terraform apply -auto-approve
 ```
 
-## ⚙️ Configuration
+## Configuration
 
 All runtime behaviour is driven through environment variables (loaded from `.env`):
 
@@ -129,9 +129,9 @@ All runtime behaviour is driven through environment variables (loaded from `.env
 | `MONITOR_URLS` | _(empty)_ | Comma-separated URLs probed each minute for HTTP health. |
 | `PPROF_ENABLED` | `false` | Expose Go pprof handlers under `/debug/pprof/`. Profiling only — never expose publicly. |
 
-## 🧠 Deep Root-Cause Analysis
+## Deep Root-Cause Analysis
 
-When a container goes down — whether through an operator's "🔍 Siasat Punca" button or the autopilot loop — Gopher-Ops assembles a **three-block evidence bundle** before consulting the AI:
+When a container goes down — whether through an operator's "Siasat Punca" button or the autopilot loop — Gopher-Ops assembles a **three-block evidence bundle** before consulting the AI:
 
 1. **Post-mortem inspect block** — exit code (with Unix-signal interpretation), `OOMKilled` flag, restart count, started/finished timestamps, memory & CPU limits, and the last five health-check probes.
 2. **System metrics snapshot** — host CPU/RAM history for the 15 minutes leading up to the failure, so the model can correlate the crash with load spikes.
@@ -139,7 +139,7 @@ When a container goes down — whether through an operator's "🔍 Siasat Punca"
 
 The diagnosis prompt explicitly instructs the model to classify the failure (OOM / panic / healthcheck / dependency / config), separate **root cause from symptom**, and cite evidence from the bundle. This is what upgrades RCA from "guess from a few log lines" to genuine forensic reasoning.
 
-## 🛡️ Reliability, Safety & Observability
+## Reliability, Safety & Observability
 
 Gopher-Ops is engineered to run unattended in production. Highlights:
 
@@ -150,13 +150,13 @@ Gopher-Ops is engineered to run unattended in production. Highlights:
 - **HITL-by-default safety mode** — the AI cannot directly execute `Stop`/`Restart` unless `AI_DESTRUCTIVE_ALLOWED=true`; otherwise it must route those through the operator's confirmation buttons.
 - **Markdown sanitization** — untrusted strings (container names, log payloads) are escaped before being rendered, so a hostile log line cannot break formatting or smuggle styling.
 - **Alert cooldown** — flapping containers won't spam the chat; repeat alerts for the same target are suppressed for `ALERT_COOLDOWN_MINUTES`.
-- **Per-alert snooze buttons** — every alert ships with `🤫 1h / 4h / 24h` buttons. Tap to suppress that specific alert key (container, disk mount, log pattern, sustained CPU). Snoozes persist across restarts in `snooze.json` and auto-expire.
+- **Per-alert snooze buttons** — every alert ships with `1h / 4h / 24h` buttons. Tap to suppress that specific alert key (container, disk mount, log pattern, sustained CPU). Snoozes persist across restarts in `snooze.json` and auto-expire.
 - **Bounded RCA cache** — entries older than 1 hour, or referring to containers that no longer exist, are evicted each tick.
 - **Structured logging** — Go's `log/slog` emits key-value fields (container ID, action, error) suitable for log aggregators.
 - **Graceful shutdown** — `SIGINT` / `SIGTERM` cancel the update loop and stop the background monitor cleanly.
 - **Self-healing monitor** — the background goroutine is wrapped in panic recovery; if it crashes, it auto-restarts after 5 seconds without taking down the bot.
 
-## 🚢 Production Deployment
+## Production Deployment
 
 Designed to be deployed and forgotten. Key production-grade properties:
 
@@ -167,14 +167,14 @@ Designed to be deployed and forgotten. Key production-grade properties:
 - **HTTP `/health` endpoint** — set `HEALTH_PORT=8080` to expose `{"status":"ok","uptime_seconds":N}` for Kubernetes liveness probes, uptime monitors, or load balancers.
 - **Audit log rotation** — `audit.log` rotates at `AUDIT_LOG_MAX_SIZE_MB` (default 10 MB), keeping `AUDIT_LOG_MAX_FILES` historical copies (default 5). Disk cannot fill from forensic logging.
 
-## 🎮 ChatOps Usage
+## ChatOps Usage
 
 Once the bot is running, simply PM it on Telegram to start managing your infrastructure:
 - *"Bro, check system health jap"* -> Bot reads live CPU/RAM and lists the Terraform-provisioned containers.
 - *"List pods dalam cluster k8s aku"* -> Bot uses MCP to fetch real-time pod data from Kubernetes.
 - *"Kenapa pod database asyik restart?"* -> Bot triggers an automated `k8s-diagnose` workflow to find the root cause.
 
-## 📁 Project Structure
+## Project Structure
 
 ```text
 .
@@ -197,14 +197,14 @@ Once the bot is running, simply PM it on Telegram to start managing your infrast
 └── README.md             # You are here!
 ```
 
-## 🗺️ Roadmap
+## Roadmap
 
 - [ ] **Multi-Cloud Support:** Integration with AWS/GCP metrics.
 - [ ] **Custom Personas:** Switch between "Chill Dev" and "Strict SRE" tones.
 - [ ] **Visual RCA:** Generate graphs for log patterns using AI.
 - [ ] **Voice Commands:** Support for Telegram Voice Notes.
 
-## 🤝 Contributing
+## Contributing
 
 Contributions are welcome! Whether it's fixing a bug, adding a new tool, or improving the documentation:
 1. Fork the Project.
@@ -214,17 +214,17 @@ Contributions are welcome! Whether it's fixing a bug, adding a new tool, or impr
 5. Open a Pull Request.
 
 
-## 📜 Credits & Acknowledgments
+## Credits & Acknowledgments
 
 The Kubernetes management capabilities of Gopher-Ops are powered by the **Model Context Protocol (MCP)** and the excellent [MCP Server Kubernetes](https://github.com/Flux159/mcp-server-kubernetes) community project. Special thanks to the authors for their work in bridging AI and Kubernetes.
 
-## 🔒 Security
+## Security
 
 Found a vulnerability? **Do not open a public issue.** See [SECURITY.md](SECURITY.md) for our coordinated disclosure policy (private GitHub Security Advisory, 72h ack, 30-day patch SLA for high/critical).
 
-## ⚠️ Disclaimer
+## Disclaimer
 This project binds to the host's Docker socket and Kubernetes API to execute real infrastructure lifecycles. Please ensure your `AUTHORIZED_CHAT_ID` is strictly configured to prevent unauthorized manipulation.
 
-## 📄 License
+## License
 This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) file for more details.
 
