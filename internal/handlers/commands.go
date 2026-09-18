@@ -12,14 +12,16 @@ import (
 	"gopher-ops/pkg/audit"
 	"gopher-ops/pkg/chaos"
 	"gopher-ops/pkg/k8s"
+	"gopher-ops/pkg/memory"
 	"gopher-ops/pkg/metrics"
 	"gopher-ops/pkg/monitor"
+	"gopher-ops/pkg/report"
+	"gopher-ops/pkg/skills"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 // StateFile is the on-disk path the monitor uses to persist alert + restart
-// trackers across reboots. The /alerts and /reset handlers also touch it.
 const StateFile = "state.json"
 
 // Command dispatches a /command message. It returns the rendered reply text;
@@ -51,6 +53,15 @@ func Command(d *bot.Deps, msg *tgbotapi.Message) string {
 	case "k8s":
 		return k8sText()
 
+	case "skills":
+		return skillsText()
+
+	case "memory":
+		return memoryText()
+
+	case "reports":
+		return reportsText()
+
 	case "chaos":
 		return chaosText(d)
 
@@ -70,6 +81,9 @@ func helpText() string {
 		"/start - Mula sembang\n" +
 		"/help - Tengok ni\n" +
 		"/status - Bot & AI status\n" +
+		"/skills - List procedural SRE runbooks\n" +
+		"/memory - Persistent SRE environment facts\n" +
+		"/reports - Archived incident post-mortem reports\n" +
 		"/containers - List semua Docker containers\n" +
 		"/metrics - Live host CPU/RAM stats\n" +
 		"/alerts - Active alert state\n" +
@@ -82,6 +96,34 @@ func helpText() string {
 		"`update <ctr> cpu <cores> mem <mb>` - Adjust resources\n" +
 		"`search <ctr> <pattern>` - Grep container logs\n" +
 		"`chaos kill <name>` - Kill specific container (chaos mode)"
+}
+
+func reportsText() string {
+	mgr, err := report.NewManager("reports")
+	if err != nil {
+		return fmt.Sprintf("❌ Error loading reports: %v", err)
+	}
+	res, err := mgr.ListRecent(10)
+	if err != nil {
+		return fmt.Sprintf("❌ Error listing reports: %v", err)
+	}
+	return res
+}
+
+func skillsText() string {
+	mgr, err := skills.NewManager("skills")
+	if err != nil {
+		return fmt.Sprintf("❌ Error loading skills: %v", err)
+	}
+	return "📚 **GOPHER-OPS SRE SKILLS:**\n\n" + mgr.GetSummaryPrompt()
+}
+
+func memoryText() string {
+	store, err := memory.NewStore("memories")
+	if err != nil {
+		return fmt.Sprintf("❌ Error loading memory: %v", err)
+	}
+	return "💾 **GOPHER-OPS PERSISTENT MEMORY:**\n\n" + store.GetPrompt()
 }
 
 func statusText(d *bot.Deps) string {

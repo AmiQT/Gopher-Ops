@@ -29,7 +29,7 @@ func NewLocalAgent(cfg Config) (*LocalAgent, error) {
 	agent := &LocalAgent{
 		client:    client,
 		model:     cfg.ModelName,
-		sysPrompt: systemPrompt,
+		sysPrompt: baseSystemPrompt,
 		history:   []openai.ChatCompletionMessage{},
 	}
 

@@ -67,8 +67,10 @@ A map of the codebase: where things live, what depends on what, and where to mak
 | `mcp` | Model Context Protocol bridge (Kubernetes) |
 | `metrics` | Prometheus collectors |
 | `monitor` | Host + container stats, disk usage, log pattern scanner, Trivy CVE scan |
+| `memory` | Persistent declarative SRE knowledge base & environment facts (`memories/SRE_FACTS.md`) |
 | `notify` | Async multi-operator Telegram broadcaster (bounded queue) |
 | `ratelimit` | Per-chat token-bucket throttle |
+| `skills` | Procedural SRE runbooks & self-improving markdown skill engine (`skills/*.md`) |
 
 ## Dependency direction
 
