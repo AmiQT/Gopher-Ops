@@ -1,0 +1,19 @@
+1
+00:00:00,800 --> 00:00:08,200
+Meet Gopher-Ops: An AI-driven SRE ChatOps platform for Docker, Kubernetes, and real-time host telemetry.
+
+2
+00:00:09,784 --> 00:00:20,500
+Operators interact seamlessly through Telegram. The Go bot parses intents with Google Gemini, orchestrating Docker and Kubernetes via the Model Context Protocol.
+
+3
+00:00:21,904 --> 00:00:32,800
+During critical incidents, Gopher-Ops detects crashes, investigates root cause logs with Gemini, and executes autonomous self-healing in minutes.
+
+4
+00:00:34,404 --> 00:00:42,200
+Engineered with Zero-Trust security, Human-in-the-Loop guardrails, and persistent SRE memory that learns from every outage.
+
+5
+00:00:43,772 --> 00:00:51,200
+Deploy in under sixty seconds with Docker Compose and Terraform. Experience modern autonomous SRE today!

@@ -28,6 +28,10 @@
 
 https://github.com/user-attachments/assets/7f9d6055-ba37-4705-b883-1d394919bcf1
 
+> **Animated Architecture & Capabilities Showcase (1080p60 + Voiceover & Subtitles):** Full 50-second animated walkthrough covering the layered Go architecture, real-world Redis OOM self-healing RCA, Zero-Trust HITL guardrails, Kubernetes MCP bridge, and Hermes SRE procedural memory.
+> - 🎬 **Video:** [`assets/gopher-ops-showcase.mp4`](assets/gopher-ops-showcase.mp4)
+> - 📝 **Subtitles (SRT):** [`assets/gopher-ops-showcase.srt`](assets/gopher-ops-showcase.srt)
+
 
 
 
