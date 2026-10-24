@@ -27,15 +27,6 @@
 
 https://github.com/user-attachments/assets/d2a754d3-ad83-4bb5-bb22-a9eb29448408
 
-<details>
-<summary>▶️ <b>Self-Healing Terminal Demo (Original 28s Recording)</b></summary>
-<br>
-
-> Watch Gopher-Ops detect a crashed Redis node, analyze the root cause (RCA) via Gemini AI, and perform an automated restart.
-
-https://github.com/user-attachments/assets/7f9d6055-ba37-4705-b883-1d394919bcf1
-
-</details>
 
 ## Architecture Workflow
 
