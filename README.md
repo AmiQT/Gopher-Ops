@@ -23,19 +23,22 @@
 
 ## Interactive Demo
 
-> **Self-Healing in Action:** Watch Gopher-Ops detect a crashed Redis node, analyze the root cause (RCA) via Gemini AI, and perform an automated restart.
+> **Animated Architecture & Capabilities Showcase (1080p60 + Voiceover & Subtitles):** Watch the full 50-second animated walkthrough covering the layered Go architecture, real-world Redis OOM self-healing RCA, Zero-Trust HITL guardrails, Kubernetes MCP bridge, and Hermes SRE procedural memory.
 
+https://github.com/user-attachments/assets/d2a754d3-ad83-4bb5-bb22-a9eb29448408
+
+> - 🎬 **Local Asset:** [`assets/gopher-ops-showcase.mp4`](assets/gopher-ops-showcase.mp4)
+> - 📝 **Subtitles (SRT):** [`assets/gopher-ops-showcase.srt`](assets/gopher-ops-showcase.srt)
+
+<details>
+<summary>▶️ <b>Self-Healing Terminal Demo (Original 28s Recording)</b></summary>
+<br>
+
+> Watch Gopher-Ops detect a crashed Redis node, analyze the root cause (RCA) via Gemini AI, and perform an automated restart.
 
 https://github.com/user-attachments/assets/7f9d6055-ba37-4705-b883-1d394919bcf1
 
-> **Animated Architecture & Capabilities Showcase (1080p60 + Voiceover & Subtitles):** Full 50-second animated walkthrough covering the layered Go architecture, real-world Redis OOM self-healing RCA, Zero-Trust HITL guardrails, Kubernetes MCP bridge, and Hermes SRE procedural memory.
-> - 🎬 **Video:** [`assets/gopher-ops-showcase.mp4`](assets/gopher-ops-showcase.mp4)
-> - 📝 **Subtitles (SRT):** [`assets/gopher-ops-showcase.srt`](assets/gopher-ops-showcase.srt)
-
-
-
-
-
+</details>
 
 ## Architecture Workflow
 
